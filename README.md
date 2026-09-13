@@ -547,6 +547,7 @@ Presentes en `pom.xml`:
 
 | Artefacto | Propósito |
 |---|---|
+| `spring-boot-starter-web` | API REST de entrada |
 | `spring-ai-starter-model-openai` | Cliente de OpenAI para los cuatro agentes |
 | `spring-boot-starter-test` | Pruebas |
 
@@ -554,7 +555,6 @@ Previstas, se añadirán en los pasos correspondientes:
 
 | Artefacto | Habilita |
 |---|---|
-| `spring-boot-starter-web` | La API REST de entrada |
 | `spring-ai-starter-vector-store-qdrant` | Búsqueda vectorial del Agent Search |
 | `spring-ai-starter-mcp-client` | Acceso de Agent Process a procedimientos vía MCP |
 | `spring-boot-starter-data-jpa` | Persistencia de auditoría |
@@ -629,13 +629,15 @@ La construcción es **incremental**: un componente por iteración.
 |---|---|---|
 | 0 | Scaffold Spring Boot + Spring AI | ✅ Completado |
 | 1 | Documentación de arquitectura (este README) | ✅ Completado |
-| 2 | Conexión del Agent Router al LLM y clasificación de intención | ⬜ Pendiente |
-| 3 | API REST de entrada y extracción del claim | ⬜ Pendiente |
-| 4 | Persistencia: esquema de auditoría | ⬜ Pendiente |
-| 5 | Agent Search sobre Qdrant | ⬜ Pendiente |
-| 6 | Agent Process vía MCP | ⬜ Pendiente |
-| 7 | Agent Executor, tools e idempotencia | ⬜ Pendiente |
-| 8 | Tool de envío al External System | ⬜ Pendiente |
+| 2 | Conexión del Agent Router al LLM vía `ChatClient` + `PromptTemplate` | ✅ Completado |
+| 3 | Endpoint REST de prueba `POST /api/v1/chat` | ✅ Completado |
+| 4 | Clasificación tipada de intención (enum) y enrutamiento real | ⬜ Pendiente |
+| 5 | Extracción del claim `user-id` desde el token | ⬜ Pendiente |
+| 6 | Persistencia: esquema de auditoría | ⬜ Pendiente |
+| 7 | Agent Search sobre Qdrant | ⬜ Pendiente |
+| 8 | Agent Process vía MCP | ⬜ Pendiente |
+| 9 | Agent Executor, tools e idempotencia | ⬜ Pendiente |
+| 10 | Tool de envío al External System | ⬜ Pendiente |
 
 ### Fuera de alcance
 
@@ -661,10 +663,22 @@ Decisiones tomadas conscientemente, no omisiones:
     └── src/
         ├── main/
         │   ├── java/com/bardalez/agents/
-        │   │   └── AgentsApplication.java
+        │   │   ├── AgentsApplication.java
+        │   │   └── router/                      # un paquete por agente
+        │   │       ├── RouterAgent.java         # lógica: renderiza el prompt e invoca al LLM
+        │   │       ├── RouterChatClientConfig.java  # ChatClient propio del Router
+        │   │       ├── RouterController.java    # POST /api/v1/chat
+        │   │       └── dto/
+        │   │           ├── RouterRequest.java
+        │   │           └── RouterResponse.java
         │   └── resources/
-        │       └── application.yaml
+        │       ├── application.yaml
+        │       └── prompts/                     # prompts externalizados
+        │           ├── router-system.st         # rol y criterio de clasificación
+        │           └── router-user.st           # plantilla con {prompt}
         └── test/
             └── java/com/bardalez/agents/
                 └── AgentsApplicationTests.java
 ```
+
+Cada agente vive en su propio paquete bajo `com.bardalez.agents`. A medida que se incorporen, se añadirán `search`, `process` y `executor` con la misma estructura interna.

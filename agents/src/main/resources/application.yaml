@@ -1,3 +1,22 @@
 spring:
   application:
     name: agents
+
+  ai:
+    openai:
+      # Define la variable de entorno OPENAI_API_KEY.
+      # Alternativa rapida para el curso: reemplaza el placeholder por tu clave,
+      # pero no la subas al repositorio.
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4o-mini
+          # temperatura 0 -> el Router es un clasificador, no debe ser creativo
+          temperature: 0.0
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.bardalez.agents: DEBUG
