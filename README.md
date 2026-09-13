@@ -14,6 +14,7 @@ El problema que resuelve: en una organización, las preguntas de los empleados (
 - [Componentes](#componentes)
 - [Enrutamiento](#enrutamiento)
 - [Guardrails de seguridad](#guardrails-de-seguridad)
+- [Memoria de conversación](#memoria-de-conversación)
 - [Diagramas de secuencia](#diagramas-de-secuencia)
 - [Contratos de datos](#contratos-de-datos)
 - [Políticas transversales](#políticas-transversales)
@@ -347,7 +348,7 @@ public void validar(String prompt) {
 }
 ```
 
-Temas permitidos: vacaciones, políticas de vacaciones, licencias y permisos, correos de asistencia y soporte, políticas contra phishing, detección de phishing, VPN, soporte de VPN, acceso a herramientas de la empresa, y temas razonablemente cercanos.
+Temas permitidos: vacaciones, políticas de vacaciones, licencias y permisos, correos de asistencia y soporte, políticas contra phishing, detección de phishing, VPN, soporte de VPN, acceso a herramientas de la empresa, **continuidad de la conversación** (ver [Memoria de conversación](#memoria-de-conversación)), y temas razonablemente cercanos.
 
 Dos detalles del prompt que sí merecen explicación en clase:
 
@@ -371,6 +372,174 @@ Content-Type: application/json
 El detalle (qué guardrail se activó y por qué) queda **solo en el log del servidor**.
 
 > **Por qué el mensaje es genérico.** Si la respuesta revelara la regla infringida, el usuario podría tantear hasta encontrar una formulación que la esquive: la propia respuesta de error se convertiría en un oráculo para construir el ataque.
+
+---
+
+## Memoria de conversación
+
+Una llamada al LLM no tiene estado: el modelo no recuerda nada de la petición anterior. Para que el usuario pueda escribir *"y para el mes que viene?"* hay que **reenviar el historial** en cada llamada. Spring AI resuelve esto con **otro advisor**, y ese es el punto didáctico: el mecanismo del guardrail y el de la memoria son el mismo.
+
+### Las tres piezas
+
+| Pieza | Responsabilidad | Implementación aquí |
+|---|---|---|
+| `ChatMemoryRepository` | **Almacén.** Guarda y lee mensajes por `conversationId` | `JdbcChatMemoryRepository` sobre MySQL (autoconfigurado) |
+| `ChatMemory` | **Política.** Qué parte del historial se envía al modelo | `MessageWindowChatMemory`, ventana de 20 mensajes |
+| `MessageChatMemoryAdvisor` | **Fontanería.** Lee el historial en `before()`, guarda el nuevo turno en `after()` | Registrado en el `ChatClient` del Router |
+
+Conviene no confundir las dos primeras: el repositorio guarda **todo** el historial; la `ChatMemory` decide **cuánto** de ese historial viaja al modelo. `MessageWindowChatMemory` conserva los últimos N mensajes y descarta los más antiguos, para que el prompt no crezca sin límite (ni el coste con él).
+
+```mermaid
+sequenceDiagram
+    participant A as RouterAgent
+    participant AD as MessageChatMemoryAdvisor
+    participant M as ChatMemory
+    participant DB as MySQL
+    participant LLM as Modelo
+
+    A->>AD: prompt + conversationId
+    AD->>M: get(conversationId)
+    M->>DB: SELECT ... WHERE conversation_id = ?
+    DB-->>M: últimos 20 mensajes
+    M-->>AD: historial
+    AD->>LLM: historial + mensaje nuevo
+    LLM-->>AD: respuesta
+    AD->>M: add(conversationId, [pregunta, respuesta])
+    M->>DB: INSERT
+    AD-->>A: respuesta
+```
+
+### El wiring
+
+Todo cabe en `RouterChatClientConfig`, junto al system prompt y al advisor del canary:
+
+```java
+@Bean
+ChatMemory chatMemory(ChatMemoryRepository chatMemoryRepository) {
+    return MessageWindowChatMemory.builder()
+            .chatMemoryRepository(chatMemoryRepository)   // el almacén: MySQL
+            .maxMessages(20)                             // la política: ventana deslizante
+            .build();
+}
+
+@Bean
+ChatClient routerChatClient(ChatClient.Builder builder, ..., ChatMemory chatMemory) {
+    return builder
+            .defaultSystem(systemPromptRenderizado)
+            .defaultAdvisors(
+                    MessageChatMemoryAdvisor.builder(chatMemory).build(),
+                    new CanaryLeakAdvisor())
+            .build();
+}
+```
+
+El `ChatMemoryRepository` no se construye: lo aporta la autoconfiguración de Spring AI a partir del `DataSource`. El bean `ChatMemory` **también** se autoconfiguraría; se declara a mano para que la relación entre almacén y política quede a la vista.
+
+> **Para qué sirve `getOrder()`.** Ahora que hay dos advisors, el número importa. La cadena es **anidada**, no secuencial: `BaseAdvisor.adviseCall()` hace `before()` → `chain.nextCall()` → `after()`, así que el advisor con el orden más bajo envuelve a los demás. `MessageChatMemoryAdvisor` usa `Advisor.DEFAULT_CHAT_MEMORY_PRECEDENCE_ORDER` (`Integer.MIN_VALUE + 200`) y `CanaryLeakAdvisor` usa `0`:
+>
+> ```text
+> memoria.before → canary.before → MODELO → canary.after → memoria.after
+> ```
+>
+> El efecto secundario es útil: si el canary salta, `canary.after()` lanza la excepción **antes** de que la memoria guarde el turno, así que una respuesta filtrada nunca queda escrita en la base de datos.
+
+### Identificar la conversación
+
+Es lo único que el agente tiene que aportar. `MessageChatMemoryAdvisor` lee el identificador del contexto del advisor, con la clave `ChatMemory.CONVERSATION_ID`:
+
+```java
+String respuesta = chatClient.prompt()
+        .user(mensajeRenderizado)
+        .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
+        .call()
+        .content();
+```
+
+No hay código que lea ni escriba el historial. El identificador llega en la cabecera **`X-Session-Id`** de la petición HTTP; si no viene, se usa `"demo"`.
+
+```bash
+curl -X POST http://localhost:8081/api/v1/chat \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Id: ana-2026-09-13' \
+  -d '{"prompt":"¿Cómo solicito mis vacaciones?"}'
+```
+
+Dos peticiones con el mismo `X-Session-Id` comparten memoria; con valores distintos no se ven entre sí.
+
+> **El guardrail temático no tiene memoria, y es deliberado.** Su `ChatClient` se construye aparte, sin advisors. Un control de seguridad debe juzgar cada mensaje por sí solo: si arrastrara historial, un atacante podría condicionarlo en turnos anteriores.
+
+### La tabla
+
+El starter trae el DDL para MySQL y lo ejecuta al arrancar, porque `application.yaml` fija `initialize-schema: always` (el valor por defecto solo inicializa bases embebidas):
+
+```sql
+CREATE TABLE IF NOT EXISTS SPRING_AI_CHAT_MEMORY (
+    `conversation_id` VARCHAR(36) NOT NULL,
+    `content`         TEXT NOT NULL,
+    `type`            ENUM('USER','ASSISTANT','SYSTEM','TOOL') NOT NULL,
+    `timestamp`       TIMESTAMP NOT NULL,
+    `sequence_id`     BIGINT NOT NULL,
+    INDEX (`conversation_id`, `timestamp`),
+    INDEX (`conversation_id`, `sequence_id`)
+);
+```
+
+Es **la misma base de datos que la de auditoría**: una sola instancia MySQL para todo el proyecto. En producción serían esquemas separados con permisos distintos; aquí es una demo y la simplicidad gana.
+
+Inspeccionarla en clase es la mejor demostración de que la memoria es real:
+
+```sql
+SELECT conversation_id, type, content FROM SPRING_AI_CHAT_MEMORY ORDER BY sequence_id;
+```
+
+> **Detalle honesto.** Lo que se guarda es el mensaje **renderizado** con la plantilla (`"Clasifica la intencion del siguiente mensaje... Mensaje: X"`), no el texto crudo del usuario. Funciona, pero el historial se lee algo repetitivo. Cuando el Router deje de ser solo un clasificador, conviene revisarlo.
+
+### Cómo comprobar que funciona
+
+Hay una trampa evidente: **el Router responde una sola palabra**. Preguntarle *"¿te acuerdas de mi nombre?"* devuelve `INFORMATIVA`, que no dice nada sobre la memoria. Responder de verdad es tarea del Agent Search, que llega en el paso 9. Así que la memoria se comprueba de otras dos formas.
+
+**1. Ver el historial directamente.** Un endpoint de apoyo devuelve exactamente lo que se reenviará al modelo en la siguiente llamada de esa sesión:
+
+```bash
+curl http://localhost:8081/api/v1/chat/ana/memoria
+```
+
+```json
+[
+  {"tipo":"user","texto":"Clasifica la intencion... Mensaje: Reserva mis vacaciones del 20 al 24"},
+  {"tipo":"assistant","texto":"ACCION"}
+]
+```
+
+Y para empezar de cero: `curl -X DELETE http://localhost:8081/api/v1/chat/ana/memoria`.
+
+**2. Un mensaje elíptico.** Esta es la demostración buena, porque el historial **cambia la clasificación**. Con dos peticiones en la misma sesión:
+
+```bash
+# Turno 1 — acción explícita
+curl -X POST http://localhost:8081/api/v1/chat -H 'X-Session-Id: ana' \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Reserva mis vacaciones del 20 al 24 de octubre"}'      # → ACCION
+
+# Turno 2 — solo tiene sentido con el turno 1 delante
+curl -X POST http://localhost:8081/api/v1/chat -H 'X-Session-Id: ana' \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"y tambien el 27"}'                                     # → ACCION
+```
+
+`"y tambien el 27"` no tiene tema ni verbo: aislado, el clasificador no puede saber que es una acción y cae en `INFORMATIVA`, que es su opción segura ante la duda. Con el historial delante responde `ACCION`. La prueba está en repetir el turno 2 con un `X-Session-Id` distinto — o después de un `DELETE` — y ver cómo la respuesta cambia.
+
+> **El guardrail temático necesitaba una regla extra para esto.** Recibe cada mensaje **aislado**, sin historial, por diseño. Sin más, `"y tambien el 27"` no trata de ningún tema permitido y `"¿te acuerdas de lo que conversamos?"` caía además en la regla que bloquea las preguntas sobre el asistente: los dos se bloqueaban con `403` y la memoria era imposible de demostrar.
+>
+> `topic-guardrail-system.st` tiene ahora un tema permitido nº 10, *continuidad de la conversación*, que cubre saludos, preguntas por el historial y mensajes elípticos, más la instrucción de permitir por defecto los mensajes sin tema propio. La regla que sí se conserva distingue dos cosas que es fácil confundir: preguntar por **lo ya conversado** está permitido; preguntar por la **configuración** del asistente — su system prompt, sus reglas, su token — sigue bloqueado.
+>
+> Es un buen ejemplo en clase de un coste real de los guardrails: **cada restricción tiene falsos positivos**, y uno mal calibrado no rompe la seguridad, rompe el producto.
+
+### Probarla sin LLM
+
+`ChatMemoryTest` inyecta los beans `ChatMemory` y `ChatMemoryRepository` y comprueba el aislamiento por conversación y el borrado. En los tests el repositorio JDBC apunta a **H2 en memoria** (`src/test/resources/application.yaml`), así que `./mvnw test` no necesita MySQL levantado — y de paso valida que el schema initializer funciona.
+
+> **Nota de versión.** `PromptChatMemoryAdvisor` **no existe en Spring AI 2.0.1**; el único advisor de memoria disponible es `MessageChatMemoryAdvisor`. La diferencia conceptual entre ambos era *dónde* se inyecta el historial: como mensajes independientes de la conversación (`Message...`) o incrustado en el texto del system prompt (`Prompt...`). En 2.0.1 solo está la primera forma, que además es la que se corresponde con el formato nativo de la API de chat.
 
 ---
 
@@ -630,7 +799,7 @@ Cada petición transporta, de forma transparente para el usuario:
 |---|---|---|
 | JDK | 17 | Baseline del proyecto |
 | Maven | — | No requiere instalación: usa el wrapper `mvnw` |
-| MySQL | 8.x | Una instancia con dos esquemas |
+| MySQL | 8.x | Una sola instancia: memoria de conversación y auditoría |
 | Qdrant | — | Alcanza con el contenedor oficial |
 | Clave de API de OpenAI | — | Ver [Configuración](#configuración) |
 
@@ -681,6 +850,14 @@ Estado actual:
 spring:
   application:
     name: agents
+
+  # Una sola instancia MySQL para memoria de conversación y, más adelante, auditoría
+  datasource:
+    url: jdbc:mysql://localhost:3306/sprintai
+    username: CAMBIAME
+    password: CAMBIAME
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
   ai:
     openai:
       api-key: ${OPENAI_API_KEY}
@@ -688,10 +865,23 @@ spring:
         options:
           model: gpt-4o-mini
           temperature: 0.0        # el Router es un clasificador, no debe ser creativo
+    chat:
+      memory:
+        repository:
+          jdbc:
+            initialize-schema: always   # crea SPRING_AI_CHAT_MEMORY al arrancar
 
 server:
-  port: 8080
+  port: 8081
+
+logging:
+  level:
+    com.bardalez.agents: DEBUG
 ```
+
+**Lo único que hay que rellenar** son las tres líneas del `datasource`: URL, usuario y contraseña de tu MySQL. La base de datos tiene que existir; la tabla la crea la aplicación. Los tests no la usan: tienen su propio `src/test/resources/application.yaml` apuntando a H2 en memoria.
+
+> Los valores `CAMBIAME` están ahí a propósito: este repositorio es público y `.gitignore` no excluye los ficheros de configuración. Si prefieres no tocar el fichero versionado, usa `${MYSQL_USER}` / `${MYSQL_PASSWORD}` y define las variables de entorno.
 
 Forma prevista a medida que se incorporen los componentes:
 
@@ -730,7 +920,10 @@ Presentes en `pom.xml`:
 |---|---|
 | `spring-boot-starter-web` | API REST de entrada |
 | `spring-ai-starter-model-openai` | Cliente de OpenAI para los cuatro agentes |
+| `spring-ai-starter-model-chat-memory-repository-jdbc` | `JdbcChatMemoryRepository` y el DDL de la tabla de memoria |
+| `mysql-connector-j` | Driver de MySQL |
 | `spring-boot-starter-test` | Pruebas |
+| `h2` | Base de datos en memoria, solo para los tests |
 
 Previstas, se añadirán en los pasos correspondientes:
 
@@ -739,7 +932,6 @@ Previstas, se añadirán en los pasos correspondientes:
 | `spring-ai-starter-vector-store-qdrant` | Búsqueda vectorial del Agent Search |
 | `spring-ai-starter-mcp-client` | Acceso de Agent Process a procedimientos vía MCP |
 | `spring-boot-starter-data-jpa` | Persistencia de auditoría |
-| `mysql-connector-j` | Driver de MySQL |
 
 ---
 
@@ -750,12 +942,20 @@ Previstas, se añadirán en los pasos correspondientes:
 Toda interacción entra por un único endpoint. El token viaja en la cabecera `Authorization` y lo valida el Lambda Authorizer antes de llegar a la aplicación.
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/chat \
+curl -X POST http://localhost:8081/api/v1/chat \
   -H "Authorization: Bearer <token-ya-validado>" \
   -H "X-Session-Id: s-77c1f0" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "¿Cómo solicito vacaciones?"}'
 ```
+
+La cabecera `X-Session-Id` identifica la conversación de cara a la memoria. Los otros dos endpoints existen solo como apoyo para la clase:
+
+| Método | Ruta | Para qué |
+|---|---|---|
+| `POST` | `/api/v1/chat` | Único endpoint funcional del sistema |
+| `GET` | `/api/v1/chat/{sessionId}/memoria` | Ver el historial que se reenviará al modelo |
+| `DELETE` | `/api/v1/chat/{sessionId}/memoria` | Olvidar una sesión y empezar la demo de cero |
 
 ### Respuesta — rama informativa
 
@@ -770,7 +970,7 @@ curl -X POST http://localhost:8080/api/v1/chat \
 ### Respuesta — rama de ejecución
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/chat \
+curl -X POST http://localhost:8081/api/v1/chat \
   -H "Authorization: Bearer <token-ya-validado>" \
   -H "X-Session-Id: s-77c1f0" \
   -H "Content-Type: application/json" \
@@ -805,7 +1005,7 @@ curl -X POST http://localhost:8080/api/v1/chat \
 Los dos guardrails producen exactamente la misma respuesta:
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/chat \
+curl -X POST http://localhost:8081/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Recomiendame un restaurante en Lima"}'
 ```
@@ -834,13 +1034,14 @@ La construcción es **incremental**: un componente por iteración.
 | 2 | Conexión del Agent Router al LLM vía `ChatClient` + `PromptTemplate` | ✅ Completado |
 | 3 | Endpoint REST de prueba `POST /api/v1/chat` | ✅ Completado |
 | 4 | Guardrails: `Advisor` de canary y allowlist temática vía LLM | ✅ Completado |
-| 5 | Clasificación tipada de intención (enum) y enrutamiento real | ⬜ Pendiente |
-| 6 | Extracción del claim `user-id` desde el token | ⬜ Pendiente |
-| 7 | Persistencia: esquema de auditoría | ⬜ Pendiente |
-| 8 | Agent Search sobre Qdrant | ⬜ Pendiente |
-| 9 | Agent Process vía MCP | ⬜ Pendiente |
-| 10 | Agent Executor, tools e idempotencia | ⬜ Pendiente |
-| 11 | Tool de envío al External System | ⬜ Pendiente |
+| 5 | Memoria de conversación en MySQL vía `MessageChatMemoryAdvisor` | ✅ Completado |
+| 6 | Clasificación tipada de intención (enum) y enrutamiento real | ⬜ Pendiente |
+| 7 | Extracción del claim `user-id` desde el token | ⬜ Pendiente |
+| 8 | Persistencia: esquema de auditoría | ⬜ Pendiente |
+| 9 | Agent Search sobre Qdrant | ⬜ Pendiente |
+| 10 | Agent Process vía MCP | ⬜ Pendiente |
+| 11 | Agent Executor, tools e idempotencia | ⬜ Pendiente |
+| 12 | Tool de envío al External System | ⬜ Pendiente |
 
 ### Fuera de alcance
 
@@ -869,8 +1070,8 @@ Decisiones tomadas conscientemente, no omisiones:
         │   │   ├── AgentsApplication.java
         │   │   ├── router/                      # un paquete por agente
         │   │   │   ├── RouterAgent.java         # renderiza el prompt e invoca al LLM
-        │   │   │   ├── RouterChatClientConfig.java  # ChatClient: system prompt + advisor
-        │   │   │   ├── RouterController.java    # POST /api/v1/chat
+        │   │   │   ├── RouterChatClientConfig.java  # ChatClient: system prompt + 2 advisors + ChatMemory
+        │   │   │   ├── RouterController.java    # POST /api/v1/chat + inspección de memoria
         │   │   │   └── dto/
         │   │   │       ├── RouterRequest.java
         │   │   │       └── RouterResponse.java
@@ -887,12 +1088,15 @@ Decisiones tomadas conscientemente, no omisiones:
         │           ├── topic-guardrail-system.st
         │           └── topic-guardrail-user.st
         └── test/
-            └── java/com/bardalez/agents/
-                ├── AgentsApplicationTests.java
-                ├── guardrail/
-                │   └── CanaryLeakAdvisorTest.java     # el advisor se prueba sin arrancar Spring
-                └── router/
-                    └── RouterPromptTemplateTest.java
+            ├── java/com/bardalez/agents/
+            │   ├── AgentsApplicationTests.java
+            │   ├── guardrail/
+            │   │   └── CanaryLeakAdvisorTest.java     # el advisor se prueba sin arrancar Spring
+            │   └── router/
+            │       ├── ChatMemoryTest.java            # memoria contra H2, sin LLM
+            │       └── RouterPromptTemplateTest.java
+            └── resources/
+                └── application.yaml                   # H2 en memoria para los tests
 ```
 
 Cada agente vive en su propio paquete bajo `com.bardalez.agents`. A medida que se incorporen, se añadirán `search`, `process` y `executor` con la misma estructura interna.

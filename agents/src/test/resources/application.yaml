@@ -1,0 +1,17 @@
+# Configuracion solo para los tests: H2 en memoria en lugar de MySQL, para que no haga falta
+# tener la base de datos levantada al ejecutar ./mvnw test.
+spring:
+  datasource:
+    url: jdbc:h2:mem:sprintai;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+
+  ai:
+    openai:
+      api-key: test-key
+    chat:
+      memory:
+        repository:
+          jdbc:
+            initialize-schema: always

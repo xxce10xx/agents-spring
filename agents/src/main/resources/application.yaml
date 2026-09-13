@@ -2,6 +2,14 @@ spring:
   application:
     name: agents
 
+  # Unica base de datos del proyecto: la misma instancia MySQL guardara la memoria de
+  # conversacion y, mas adelante, la auditoria. Es una demo: se prioriza la simplicidad.
+  datasource:
+    url: jdbc:mysql://localhost:3306/sprintai
+    username: ${MYSQL_USERNAME}
+    password: ${MYSQL_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
   ai:
     openai:
       # Define la variable de entorno OPENAI_API_KEY.
@@ -13,6 +21,14 @@ spring:
           model: gpt-4o-mini
           # temperatura 0 -> el Router es un clasificador, no debe ser creativo
           temperature: 0.0
+
+    chat:
+      memory:
+        repository:
+          jdbc:
+            # Crea la tabla SPRING_AI_CHAT_MEMORY al arrancar si no existe.
+            # Con el valor por defecto (embedded) MySQL no se inicializaria.
+            initialize-schema: always
 
 server:
   port: 8081
