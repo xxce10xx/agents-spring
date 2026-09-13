@@ -9,8 +9,9 @@ package com.bardalez.agents.router.dto;
  * original y el identificador de sesion.
  *
  * @param intencion {@code INFORMATIVA} o {@code ACCION}
- * @param respuesta texto para el empleado, o {@code null} si todavia no hay ningun agente capaz de
- *                  producirlo (es el caso de la rama de accion hasta que exista el Agent Process)
+ * @param respuesta texto para el empleado. Lo redacta el Router: en la rama informativa es lo que
+ *                  contesto Search; en la de accion, los pasos que resolvio Process (o el aviso de
+ *                  que no existe ese procedimiento). Los agentes devuelven datos, el hub los cuenta
  */
 public record Resultado(String intencion, String respuesta) {
 }

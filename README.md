@@ -6,6 +6,17 @@ El problema que resuelve: en una organización, las preguntas de los empleados (
 
 > **Naturaleza del proyecto:** aplicación de muestra con fines didácticos. Prioriza claridad arquitectónica sobre robustez de producción.
 
+### El sistema son dos repositorios
+
+Sprint AI no se despliega solo: el catálogo de procedimientos vive **fuera**, detrás de un servidor MCP con su propio repositorio y su propio proceso.
+
+| Repositorio | Artefacto | Puerto | Responsabilidad |
+|---|---|---|---|
+| **este** ([`agents-spring`](https://github.com/xxce10xx/agents-spring)) | `agents.jar` | `8081` | Los cuatro agentes, la memoria y la API de entrada |
+| [`mcp-spring`](https://github.com/xxce10xx/mcp-spring) — [📄 su README](https://github.com/xxce10xx/mcp-spring#readme) | `mcp-procesos.jar` | `8082` | Servidor MCP: publica el catálogo de procedimientos de `MySQL.procesos` |
+
+El Agent Process de este repositorio es **cliente** del otro: no consulta esa tabla por JDBC, le pide el catálogo por protocolo. Para levantar la rama de acción hacen falta los dos procesos — ver [Agent Process: el catálogo por MCP](#agent-process-el-catálogo-por-mcp).
+
 ---
 
 ## Tabla de contenidos
@@ -15,6 +26,8 @@ El problema que resuelve: en una organización, las preguntas de los empleados (
 - [Enrutamiento](#enrutamiento)
 - [Guardrails de seguridad](#guardrails-de-seguridad)
 - [Agent Search: RAG sobre Qdrant](#agent-search-rag-sobre-qdrant)
+- [Agent Process: el catálogo por MCP](#agent-process-el-catálogo-por-mcp)
+- [Agent Executor: las tools y el informe](#agent-executor-las-tools-y-el-informe)
 - [Memoria de conversación](#memoria-de-conversación)
 - [Diagramas de secuencia](#diagramas-de-secuencia)
 - [Contratos de datos](#contratos-de-datos)
@@ -49,7 +62,8 @@ graph LR
     end
 
     QD[("Qdrant<br/>vectorial")]
-    DBP[("MySQL<br/>procedimientos")]
+    MCPS["mcp-procesos.jar :8082<br/>servidor MCP · otro repositorio"]
+    DBP[("MySQL<br/>procesos")]
     DBA[("MySQL<br/>auditoría")]
     EXT(["External System<br/>reportería"])
 
@@ -59,7 +73,8 @@ graph LR
     R -->|"routes"| P
     R -->|"routes"| E
     S --> QD
-    P -->|"MCP"| DBP
+    P -->|"MCP / HTTP"| MCPS
+    MCPS -->|"SELECT"| DBP
     E --> TA
     E --> TB
     E --> TC
@@ -85,7 +100,7 @@ Actor ──HTTP POST──→ [Lambda Authorizer: valida token] ──→ agent
       ┌───────────────────────────────────────────────────────┴──────────┐
       │ INFORMATIVA / ambiguo                          ACCIÓN            │
       ↓                                                   ↓              │
-   SEARCH ──→ Qdrant                                   PROCESS ──MCP──→ MySQL.procedimientos
+   SEARCH ──→ Qdrant                                   PROCESS ──MCP──→ mcp-procesos:8082 ──→ MySQL.procesos
       │                                                   │
       └──→ Router → Usuario                    ┌──────────┴──────────┐
                                           NOT_FOUND              pasos[]
@@ -93,9 +108,8 @@ Actor ──HTTP POST──→ [Lambda Authorizer: valida token] ──→ agent
                                      Router → Usuario            ROUTER
                                      "No disponemos..."             ↓
                                                                  EXECUTOR
-                                                            tool A / B / C
-                                                            3 reintentos × 5s, idempotentes
-                                                            {execution-id}:{step-index}
+                                                            tool A / B / C  (tool calling)
+                                                            reintentos e idempotencia: pendientes
                                                                     ↓
                                                           structured output → POJO
                                                                     ↓
@@ -125,7 +139,7 @@ Actor ──HTTP POST──→ [Lambda Authorizer: valida token] ──→ agent
 |---|---|---|---|
 | **Agent Router** | Clasificar intención, orquestar, recordar, persistir y publicar | Lee y escribe `MySQL.memoria` y `MySQL.auditoria`, llama al External System | Sí |
 | **Agent Search** | Responder preguntas desde documentación corporativa | Lee Qdrant | No (solo lectura) |
-| **Agent Process** | Recuperar la definición de un procedimiento | Lee `MySQL.procedimientos` vía MCP | No (solo lectura) |
+| **Agent Process** | Recuperar la definición de un procedimiento | Lee `MySQL.procesos` vía MCP (otro proceso) | No (solo lectura) |
 | **Agent Executor** | Ejecutar las tools en el orden que dicta el procedimiento | Invoca tools de negocio | Sí |
 
 ### Agent Router
@@ -153,7 +167,7 @@ Ya está implementado — los detalles, en [Agent Search: RAG sobre Qdrant](#age
 
 ### Agent Process
 
-Recupera de `MySQL.procedimientos`, **a través de un servidor MCP**, la definición del procedimiento que el usuario solicitó, y la entrega al Router.
+Recupera el catálogo de procedimientos **a través de un servidor MCP** ([`mcp-spring`](https://github.com/xxce10xx/mcp-spring)), decide cuál corresponde a lo que pidió el empleado y entrega sus pasos al Router.
 
 Separa el *qué hacer* del *hacerlo*: Process solo lee la definición. Esto convierte cada procedimiento en un **dato versionable en base de datos**, no en lógica incrustada en un prompt.
 
@@ -162,7 +176,9 @@ Dos salidas posibles:
 | Salida | Significado | Acción del Router |
 |---|---|---|
 | `pasos[]` | Procedimiento encontrado | Invoca al Agent Executor |
-| `NOT_FOUND` | No existe ese procedimiento | Responde en lenguaje natural: *"No disponemos de ese procedimiento"*. **No** hay fallback a Search |
+| `NOT_FOUND` | No existe ese procedimiento | Responde en lenguaje natural: *"No tengo ningún procedimiento definido para eso"*. **No** hay fallback a Search |
+
+Ya está implementado — los detalles, en [Agent Process: el catálogo por MCP](#agent-process-el-catálogo-por-mcp).
 
 ### Agent Executor
 
@@ -171,10 +187,12 @@ Recibe los pasos que el Router obtuvo de Process e invoca las tools **en el orde
 Garantías de diseño:
 
 - **Nunca lanza excepción hacia arriba.** Siempre devuelve el mismo contrato JSON, con `estado` como discriminante.
-- **Todas las tools son idempotentes**, porque cada paso se reintenta.
 - **Reporta el detalle paso a paso**, no solo el resultado global.
+- **Todas las tools deben ser idempotentes**, porque todo paso se reintenta. Los reintentos aún no están implementados — ver [Políticas transversales](#reintentos).
 
-En el diagrama de arquitectura las tools aparecen como `tool A`, `tool B` y `tool C`: son **marcadores de posición**, aún sin nombres de dominio definitivos.
+En el diagrama de arquitectura las tools aparecen como `tool A`, `tool B` y `tool C`: son **marcadores de posición** deliberados. Lo que enseña este agente es el mecanismo (cómo se declara una tool, cómo llega al modelo y quién decide invocarla), no la lógica de un sistema de RRHH concreto.
+
+Ya está implementado — los detalles, en [Agent Executor: las tools y el informe](#agent-executor-las-tools-y-el-informe).
 
 ---
 
@@ -630,18 +648,401 @@ Las instrucciones de Search viven donde deben: en el **system prompt** (`search-
 
 `RouterAgent.atender()` devuelve un `Resultado(String intencion, String respuesta)` — un record en `router/dto/`, junto a los otros dos contratos del Router — y el controlador lo traduce a `RouterResponse` añadiendo el prompt original y la sesión.
 
-La rama de `ACCION` devuelve la intención con la respuesta a `null`: quien tiene que producirla es el Agent Process, que llega en el paso 10. No hay ningún mensaje de relleno inventado — el sistema clasifica correctamente y ahí se detiene.
+Las dos ramas devuelven ya el mismo contrato, y el guardado de la memoria quedó **fuera** del `if`:
 
 ```java
-if (ACCION.equals(intencion)) {
-    // TODO: enrutar al Agent Process, que recuperara la definicion del procedimiento.
-    return new Resultado(intencion, null);
-}
+String respuesta = ACCION.equals(intencion)
+        ? atenderAccion(prompt, memoria)         // Process (MCP) y luego Executor
+        : atenderInformativa(prompt, memoria);   // Search: RAG sobre Qdrant
 
-String respuesta = searchAgent.responder(prompt, memoria);
 chatMemory.add(sessionId, List.of(new UserMessage(prompt), new AssistantMessage(respuesta)));
 return new Resultado(intencion, respuesta);
 ```
+
+Ese `chatMemory.add` común es la demostración práctica de por qué [la memoria pertenece al Router](#la-memoria-pertenece-al-router): los dos agentes se benefician de ella sin saber que existe.
+
+---
+
+## Agent Process: el catálogo por MCP
+
+Cuando la intención es `ACCION`, el Router delega en el **Agent Process**, que responde a una pregunta muy distinta de la de Search: no *"¿qué le contesto?"*, sino *"¿existe un procedimiento para esto y de qué pasos consta?"*.
+
+La diferencia importante está en de dónde saca la respuesta. Search consulta una base vectorial *dentro* de este proceso; Process consulta **otro proceso**, por protocolo:
+
+```mermaid
+graph LR
+    R["Agent Router<br/>agents.jar :8081"] -->|"prompt + memoria"| P["Agent Process"]
+    P -.->|"MCP / HTTP<br/>tools/call listar_procesos"| M["mcp-procesos<br/>:8082 /mcp"]
+    M -->|SELECT| DB[("MySQL<br/>tabla procesos")]
+    P -.->|"catálogo + memoria"| L(["OpenAI LLM"])
+    L -.->|"elige uno"| P
+    P -->|"Procedimiento(pasos[])"| R
+```
+
+El servidor MCP es un proyecto aparte, con su propio repositorio: [**`mcp-spring`**](https://github.com/xxce10xx/mcp-spring) — su [README](https://github.com/xxce10xx/mcp-spring#readme) documenta la tabla `procesos`, las dos herramientas que publica y cómo se levanta.
+
+### Por qué el catálogo vive detrás de un protocolo
+
+Un `JdbcClient` contra la tabla `procesos` habría sido más corto. Lo que se gana con MCP:
+
+| | Con MCP | Con JDBC directo |
+|---|---|---|
+| Quién administra los procedimientos | Un servicio propio, desplegable aparte | El equipo del agente |
+| Otros consumidores | Cualquier cliente MCP: Claude Desktop, el Inspector, otro agente | Solo `agents.jar` |
+| Acoplamiento | Un contrato JSON | Un esquema de base de datos y sus credenciales |
+| Precio | Un proceso más que levantar, un contrato que el compilador no vigila | Ninguno |
+
+La última fila es real y conviene decirla: el `record Proceso` está **duplicado** en los dos repositorios a propósito. No comparten librería, así que si allí renombran un campo, aquí llega `null` sin que nada falle. Es el coste de integrar por protocolo en lugar de por dependencia Maven, y a cambio el servidor puede evolucionar sin recompilar el agente.
+
+### El ciclo completo
+
+```mermaid
+sequenceDiagram
+    participant R as RouterAgent
+    participant P as ProcessAgent
+    participant C as CatalogoProcesos
+    participant M as mcp-procesos :8082
+    participant L as OpenAI
+
+    R->>P: resolver(prompt, memoria)
+    P->>C: listar()
+    C->>M: initialize (solo la primera vez)
+    C->>M: tools/call listar_procesos
+    M-->>C: TextContent con el JSON del catálogo
+    C-->>P: List&lt;Proceso&gt;
+    P->>L: system + memoria + catálogo en texto + prompt
+    L-->>P: Eleccion(encontrado, proceso, motivo)
+    P->>P: busca el nombre elegido en el catálogo
+    P->>C: pasosDe(proceso)
+    P-->>R: Procedimiento(proceso, tipo, pasos[])
+    R-->>R: redacta la respuesta y guarda el turno
+```
+
+Tres decisiones dentro de ese diagrama merecen explicación.
+
+### 1. El LLM elige, pero Java copia los pasos
+
+Es la parte más importante del agente, y la que no se ve en el diagrama de un vistazo. El modelo recibe el catálogo entero y devuelve **solo un nombre**:
+
+```java
+public record Eleccion(boolean encontrado, String proceso, String motivo) { }
+```
+
+Los pasos los copia el código de la fila que llegó por MCP:
+
+```java
+return catalogo.stream()
+        .filter(proceso -> proceso.proceso().equalsIgnoreCase(eleccion.proceso()))
+        .findFirst()
+        .map(proceso -> new Procedimiento(true, proceso.proceso(), proceso.tipo(),
+                catalogoProcesos.pasosDe(proceso)))
+        .orElseGet(Procedimiento::noEncontrado);   // el modelo se inventó el nombre
+```
+
+Pedirle al modelo que devolviera también la secuencia habría funcionado **casi siempre** — la tiene delante, en el prompt. Casi siempre no basta cuando el siguiente eslabón va a *ejecutar* esa lista: una tool inventada es indistinguible de una real hasta que se intenta invocar. Con este reparto, lo peor que puede pasar es elegir el procedimiento equivocado, que es un fallo visible; y si el nombre elegido no está en el catálogo, se trata como `NOT_FOUND` con un `WARN` en el log.
+
+> **La regla generalizable:** deja al LLM la decisión que requiere entender lenguaje, y al código el dato que tiene que ser exacto.
+
+### 2. Se llama al MCP con código, no con *tool calling*
+
+Spring AI puede exponer las herramientas MCP al modelo como *tools* con una sola propiedad. Aquí está desactivada:
+
+```yaml
+spring:
+  ai:
+    mcp:
+      client:
+        toolcallback:
+          enabled: false      # las tools MCP NO se ofrecen al LLM
+```
+
+El motivo es que la decisión no es genuina: el Agent Process **siempre** necesita el catálogo. Ofrecérselo al modelo sería pagar una llamada extra para que conteste lo que ya sabemos, con la posibilidad añadida de que decida no llamar. El *tool calling* se gana su sitio cuando el modelo tiene que elegir entre varias herramientas o decidir si hace falta alguna; no cuando el flujo es fijo.
+
+```java
+CallToolRequest peticion = CallToolRequest.builder("listar_procesos")
+        .arguments(Map.of())      // esta herramienta no tiene parámetros
+        .build();
+
+CallToolResult resultado = cliente.callTool(peticion);
+String json = ((TextContent) resultado.content().get(0)).text();
+List<Proceso> procesos = jsonMapper.readValue(json, LISTA_DE_PROCESOS);
+```
+
+El contenido de una respuesta MCP viaja **como texto** aunque el servidor devolviera una lista de objetos: dentro del `TextContent` está el JSON serializado.
+
+> **Ojo con el atajo.** El constructor `new CallToolRequest(nombre, argumentos)` está `@Deprecated` en el SDK 2.0, igual que `builder()` sin argumentos. El record tiene tres componentes —`name`, `arguments` y `_meta`— y la versión corta escondía que el tercero llegaba a `null`; lo vigente es `builder(nombre)`.
+
+### 3. `initialized: false`, o el agente no arranca
+
+El detalle de configuración que más caro sale si se descubre en producción:
+
+```yaml
+spring:
+  ai:
+    mcp:
+      client:
+        initialized: false          # el handshake se hace en la primera llamada
+        streamable-http:
+          connections:
+            procesos:
+              url: http://localhost:8082    # solo el origen
+              endpoint: /mcp                # la ruta va aparte
+```
+
+Con el valor por defecto (`true`), la autoconfiguración llama a `initialize()` al crear el bean: si `mcp-procesos` está caído, **`agents.jar` no arranca**. Un servidor de procedimientos apagado dejaría sin servicio también a la rama informativa, que no lo necesita para nada. Con `false`, Spring AI envuelve cada llamada en un `LifecycleInitializer` que hace el handshake la primera vez que hace falta, y el fallo queda acotado a la rama que sí depende del MCP.
+
+Nótese también que la URL es **solo el origen**: la ruta del protocolo se configura aparte en `endpoint`. Escribir `url: http://localhost:8082/mcp` produce peticiones a `/mcp/mcp`.
+
+### Del JSON a la lista de pasos
+
+La `secuencia` llega como texto JSON, tal como la guarda el servidor:
+
+```json
+{"paso 1": "tool-A", "paso 2": "tool-B"}
+```
+
+Y se traduce ordenando **por clave**, no por orden de llegada:
+
+```java
+public List<String> pasosDe(Proceso proceso) {
+    Map<String, String> secuencia = new TreeMap<>(jsonMapper.readValue(proceso.secuencia(), PASOS));
+    return List.copyOf(secuencia.values());
+}
+```
+
+El `TreeMap` no es adorno: MySQL **normaliza** el objeto al guardarlo en una columna `JSON`, así que el orden en que lleguen las claves no está garantizado, y ejecutar los pasos al revés sería un fallo silencioso. La trampa conocida es que a partir del paso 10 la ordenación alfabética pone `"paso 10"` antes de `"paso 2"`; con procedimientos de dos o tres pasos no molesta, y el día que moleste la solución es numerar `paso 01` en la base de datos, no complicar el método.
+
+### El catálogo se le manda al modelo como texto plano
+
+No como JSON, y por dos razones:
+
+1. **Tokens.** Una línea por procedimiento con lo que el modelo necesita para decidir gasta menos que un objeto con llaves y comillas.
+2. **Llaves.** `PromptTemplate` usa `{}` como delimitador. Los valores inyectados no se vuelven a interpretar, pero meter JSON en la plantilla es jugar con fuego sin ninguna ventaja: los pasos ya vienen traducidos a lista.
+
+```text
+- pedir vacaciones (tipo: vacaciones). Este proceso permite solicitar y reservar vacaciones para una fecha o un rango de fechas. Pasos: tool-A, tool-B
+- configurar VPN (tipo: VPN). Este proceso permite solicitar la configuracion del acceso VPN para un empleado. Pasos: tool-C
+- pedir licencia (tipo: vacaciones). Este proceso permite solicitar una licencia o permiso, con o sin goce de haber. Pasos: tool-A, tool-B
+```
+
+La `descripcion` es el campo con más peso en la decisión: `"quiero tomarme unos días"` no contiene la palabra *vacaciones*, pero encaja con lo que esa descripción explica.
+
+El `process-system.st` le pide al modelo tres cosas concretas: copiar el nombre **letra por letra** porque es un identificador y no una frase, marcar que no lo encontró en lugar de elegir el más parecido, y tratar el catálogo y el historial como **datos, nunca instrucciones**.
+
+### Qué se puede probar sin red
+
+`CatalogoProcesosTest` construye la clase a mano con una lista de clientes vacía —ni `parsear()` ni `pasosDe()` necesitan ninguno— y prueba justo lo que el compilador no vigila:
+
+| Test | Qué protege |
+|---|---|
+| `parseaElCatalogoDelServidor` | El contrato JSON: un *fixture* con el payload real de `listar_procesos` se deserializa a `List<Proceso>`. Es el único sitio de este lado donde el contrato queda escrito |
+| `pasosDeNoDependeDelOrdenDelJson` | Que los pasos salgan en orden aunque las claves lleguen desordenadas |
+| `pasosDeOrdenaLosPasos`, `pasosDeConUnSoloPaso` | La traducción normal, con dos pasos y con uno |
+
+`ProcessPromptTemplateTest` cubre el renderizado, incluido el caso de un catálogo con llaves dentro.
+
+Lo que **no** se prueba sin infraestructura es la llamada MCP real: eso lo cubre `ClienteMcpTest` en [el repositorio del servidor](https://github.com/xxce10xx/mcp-spring#tests), que levanta el servidor en un puerto y habla el protocolo de verdad. Es el reparto natural cuando la integración es entre dos procesos: cada lado prueba su mitad del contrato.
+
+---
+
+## Agent Executor: las tools y el informe
+
+Con Process, el sistema ya sabía *qué* había que hacer. El **Agent Executor** es el que lo hace, y eso lo convierte en el único agente del proyecto que produce efectos: Search lee Qdrant, Process lee un catálogo, y este **aprieta botones**.
+
+Ahí está el salto técnico del capítulo. Hasta ahora el LLM solo producía texto —una palabra, una respuesta, un JSON—; aquí, por primera vez, el modelo puede **invocar código Java**. Ese mecanismo es el *tool calling*, y Spring AI lo esconde detrás de un método del builder:
+
+```mermaid
+graph LR
+    R["Agent Router"] -->|"Procedimiento(pasos[])"| E["Agent Executor"]
+    E -.->|"prompt + esquema de las tools"| L(["OpenAI LLM"])
+    L -.->|"llama a tool-A"| E
+    E --> TA{{"tool-A"}}
+    E --> TB{{"tool-B"}}
+    E --> TC{{"tool-C"}}
+    E -->|"Ejecucion(estado, pasos)"| R
+```
+
+### El ciclo completo
+
+```mermaid
+sequenceDiagram
+    participant R as RouterAgent
+    participant E as ExecutorAgent
+    participant L as OpenAI
+    participant T as HerramientasFicticias
+
+    R->>E: ejecutar(Procedimiento)
+    Note over E: rechaza lo que no venga<br/>de una resolución de Process
+    E->>L: system + procedimiento + pasos numerados + tools disponibles
+    L-->>E: tool_call: tool-A
+    E->>T: toolA()
+    T-->>E: "tool-A ejecutada correctamente"
+    E->>L: resultado de tool-A
+    L-->>E: tool_call: tool-B
+    E->>T: toolB()
+    T-->>E: "tool-B ejecutada correctamente"
+    E->>L: resultado de tool-B
+    L-->>E: Ejecucion(estado, pasosExitosos, pasosFallidos, resumen)
+    E-->>R: informe
+    R-->>R: redacta la respuesta y guarda el turno
+```
+
+Todo el bucle del centro —las idas y venidas entre el modelo y los métodos Java— ocurre **dentro de un único `call()`**. Desde el código del agente no se ve; es lo que gestiona Spring AI cuando el ChatClient tiene herramientas registradas.
+
+### 1. Una tool es un método con una anotación
+
+```java
+@Component
+public class HerramientasFicticias {
+
+    public static final List<String> NOMBRES = List.of("tool-A", "tool-B", "tool-C");
+
+    @Tool(name = "tool-A",
+            description = """
+                    Ejecuta el paso de negocio A de un procedimiento de la empresa. Invocala solo \
+                    cuando la secuencia del procedimiento que estas ejecutando incluya 'tool-A', y \
+                    en la posicion que indique esa secuencia.""")
+    public String toolA() {
+        log.info(">>> tool-A ejecutada");
+        return "tool-A ejecutada correctamente";
+    }
+    // tool-B y tool-C, iguales
+}
+```
+
+Tres detalles que no son evidentes:
+
+**1. El `name` es un contrato con una base de datos de otro repositorio.** La columna `secuencia` de la tabla `procesos` guarda literalmente `{"paso 1": "tool-A", "paso 2": "tool-B"}`. Entre esa cadena y este método no hay compilador: renombrar la tool deja procedimientos apuntando a herramientas que no existen, y el síntoma aparece en tiempo de ejecución, como un paso fallido. De ahí el test que comprueba los nombres por reflexión.
+
+**2. Devuelven `String` y no `void`, a propósito.** Lo que devuelve una tool **vuelve al modelo** como resultado de la llamada. Es lo que le permite saber que el paso salió bien antes de pedir el siguiente; con `void`, Spring AI le manda un `"Done"` genérico y el informe final se queda sin nada que contar.
+
+**3. La `description` está escrita para que el modelo *no* la use de más.** No describe solo qué hace la tool, sino cuándo puede invocarla: *"solo cuando la secuencia del procedimiento la incluya, y en la posición que indique esa secuencia"*.
+
+Que sean ficticias no es una deuda pendiente, es el recorte deliberado del proyecto: escriben una línea en la consola y devuelven una confirmación. El día que `tool-A` sea `validarSaldoVacaciones`, nada del resto del sistema cambia.
+
+```text
+INFO  c.b.a.executor.HerramientasFicticias : >>> tool-A ejecutada
+INFO  c.b.a.executor.HerramientasFicticias : >>> tool-B ejecutada
+INFO  c.b.agents.executor.ExecutorAgent    : Executor: 'pedir vacaciones' termino con estado EXITOSO (2 pasos correctos, 0 fallidos)
+```
+
+### 2. Las tools se registran en un solo ChatClient
+
+```java
+return builder
+        .defaultSystem(systemPromptRenderizado)
+        .defaultAdvisors(new CanaryLeakAdvisor())
+        .defaultTools(herramientas)     // el bean entero: una tool por método anotado
+        .build();
+```
+
+`defaultTools(Object...)` es la firma vigente en Spring AI 2.0; `defaultToolCallbacks(...)` está `@Deprecated`. Se le pasa el bean y él escanea las anotaciones.
+
+> **La superficie de acción del sistema no la fija el prompt, la fija este `.defaultTools(...)`.** El Router, Search y Process tienen sus propios `ChatClient` **sin** herramientas: sus modelos no pueden invocar `tool-A` ni aunque el empleado se lo pida con mucha educación, porque no existe en el esquema que reciben. Un guardrail se puede sortear con la frase adecuada; esto no.
+
+### 3. Un solo `call()` para ejecutar e informar
+
+```java
+Ejecucion ejecucion = chatClient.prompt()
+        .user(mensajeRenderizado)
+        .call()
+        .entity(Ejecucion.class);
+```
+
+Las dos mitades del trabajo caben en esa expresión: dentro de `call()` Spring AI ejecuta todas las tools que el modelo vaya pidiendo, y cuando el modelo deja de pedir llamadas, `entity(...)` deserializa su última respuesta en el informe.
+
+Lo que **no** recibe este agente también dice algo: no recibe la memoria de la conversación. Cuando el Executor entra en escena la decisión ya está tomada; darle el historial solo abriría la puerta a que reinterpretara el procedimiento a la luz de algo que el empleado dijo tres turnos antes.
+
+### 4. Al Executor no se entra sin pasar por Process
+
+El [invariante de seguridad](#invariante-de-seguridad) del proyecto está escrito como control de flujo. La única invocación al Executor de todo el código vive **dentro** del `if`:
+
+```java
+Procedimiento procedimiento = processAgent.resolver(prompt, memoria);
+
+if (!procedimiento.encontrado()) {
+    return "No tengo ningún procedimiento definido para eso, así que no puedo tramitarlo. ...";
+}
+
+// La única invocación al Executor de todo el proyecto, y está aquí: después del if, no antes.
+Ejecucion ejecucion = executorAgent.ejecutar(procedimiento);
+return redactar(procedimiento, ejecucion);
+```
+
+Y no se confía solo en eso. La firma pide un `Procedimiento`, no una `List<String>`: quien quisiera saltarse a Process tendría que fabricarse uno a mano, y aun así el agente lo rechaza:
+
+```java
+if (procedimiento == null || !procedimiento.encontrado() || procedimiento.pasos().isEmpty()) {
+    throw new IllegalArgumentException(
+            "El Agent Executor solo se puede invocar con un procedimiento encontrado por el "
+                    + "Agent Process y con al menos un paso");
+}
+```
+
+Esta excepción no contradice la garantía de *"nunca lanza excepción hacia arriba"*: no es un resultado de negocio, es un invariante roto, o sea un fallo de programación. Los fallos de negocio salen por el informe; los bugs, cuanto más ruidosos, mejor.
+
+### Un fallo del modelo también es un informe
+
+El resto del agente es un `try/catch` con una asimetría que conviene entender:
+
+| Qué pasa | Qué devuelve | Por qué |
+|---|---|---|
+| El modelo responde | El informe que escribió | El caso normal |
+| El modelo no devuelve informe, o la llamada se rompe | `Ejecucion.errorTecnico(...)`: todos los pasos fallidos, motivo en el `detalle` | Aquí ya puede haber efectos producidos. Un 500 seco no dice qué se alcanzó a hacer |
+| Salta el guardrail del canary | **La excepción sube** | Un bloqueo de seguridad tiene que llegar como `403`, no disfrazado de *"no se pudo ejecutar el paso 2"* |
+
+Es lo contrario de lo que hace [`CatalogoProcesos`](#2-se-llama-al-mcp-con-código-no-con-tool-calling), que no captura nada. La diferencia es que si Process falla, no se ha hecho nada y el error honesto es un 500; si falla el Executor, puede haber medio procedimiento ejecutado y callarse es la peor opción.
+
+### El informe no lo firma el modelo: lo normaliza Java
+
+`Ejecucion` es un record con lógica en el constructor, y no por gusto: el objeto lo rellena un LLM. De ahí llegan dos desperfectos habituales —campos ausentes, que en Java son `null`, y un estado global que no concuerda con el detalle— y los dos se corrigen una sola vez, aquí:
+
+```java
+public Ejecucion {
+    pasosExitosos = pasosExitosos == null ? List.of() : List.copyOf(pasosExitosos);
+    pasosFallidos = pasosFallidos == null ? List.of() : List.copyOf(pasosFallidos);
+
+    if (estado == null) {
+        estado = EstadoEjecucion.FALLIDO;          // fallar cerrado
+    }
+    if (!pasosFallidos.isEmpty()) {
+        estado = EstadoEjecucion.FALLIDO;          // manda el detalle, no el titular
+    }
+    ...
+}
+```
+
+La segunda línea es la que importa. Un modelo puede perfectamente listar un paso fallido y declararse `EXITOSO`: de esos dos datos, el fiable es la lista. **El estado general no lo decide el modelo, lo deriva el detalle**, y sin esa línea el Router le diría *"listo"* al empleado sobre un trámite hecho a medias.
+
+### El límite honesto: el informe es lo que el modelo dice que pasó
+
+Las tools se ejecutan de verdad —el log de la consola lo prueba—, pero el que redacta el informe es el mismo modelo que las invocó. No hay, todavía, nadie que compare lo que dice el JSON con lo que realmente se llamó.
+
+Para una demo es aceptable y el prompt insiste en ello (*"no des por ejecutado un paso que no invocaste"*), pero conviene decirlo: la comprobación de verdad es el **registro de auditoría**, y llega en su paso del roadmap. Ese registro no se escribe desde el informe del modelo, se escribe desde el lado Java de cada invocación.
+
+### Lo que este agente todavía no hace
+
+| Pendiente | Dónde está documentado |
+|---|---|
+| Reintentos (3 × 5 s) por paso | [Políticas transversales](#reintentos) |
+| Clave de idempotencia `{execution-id}:{step-index}` | [Idempotencia](#idempotencia) |
+| Persistir el informe en `MySQL.auditoria` | [Esquema de auditoría](#esquema-de-auditoría) |
+| Publicar el resultado al External System | [Dos estados independientes](#dos-estados-independientes) |
+
+Sin reintentos, la idempotencia todavía no tiene consumidor: una clave que nadie repite no protege de nada. Las dos cosas llegan juntas o no llegan.
+
+### Qué se puede probar sin red
+
+Ninguno de los cuatro tests del Executor habla con OpenAI:
+
+| Test | Qué protege |
+|---|---|
+| `HerramientasFicticiasTest` | Que las tres tools se publiquen como `tool-A`, `tool-B` y `tool-C` —el contrato con la tabla `procesos`—, que todas lleven `description` y que devuelvan su confirmación. Lee las anotaciones por reflexión, igual que Spring AI |
+| `ExecutorAgentTest` | El invariante: un procedimiento `noEncontrado()`, vacío o `null` se rechaza. El `ChatClient` se construye a `null` a propósito, así que si el rechazo no ocurriera antes de llamar al modelo, el test fallaría con `NullPointerException` |
+| `EjecucionTest` | Las normalizaciones del informe: listas nulas, estado ausente, el paso fallido que manda sobre el estado y el `errorTecnico` |
+| `ExecutorPromptTemplateTest` | El renderizado de las dos plantillas, incluido un nombre de procedimiento con llaves |
+
+Lo que no se prueba sin LLM es el bucle de *tool calling* completo: para eso hay que levantar el sistema y mirar el log, que es justo lo que muestra [Uso](#respuesta--rama-de-ejecución).
 
 ---
 
@@ -667,13 +1068,16 @@ Es una decisión de arquitectura, no de comodidad. El Router es el **único comp
 graph LR
     R["Agent Router<br/>dueño de la memoria"] -->|prompt + memoria| S[Agent Search]
     R -->|prompt + memoria| P[Agent Process]
-    P --> E[Agent Executor]
+    P -.->|"pasos[]"| R
+    R -->|"solo el procedimiento,<br/>sin memoria"| E[Agent Executor]
     R <-->|get / add| DB[(MySQL)]
 ```
 
 Si la memoria viviera en el Agent Search, la rama de **acción** se quedaría sin conversación: cuando el mensaje se clasifica como `ACCION`, el Router va directo a Process y Search no llega a intervenir. Ese empleado que pidió *"reserva mis vacaciones"* y luego escribe *"y también el 27"* estaría hablando con un sistema amnésico.
 
 Los agentes destino, por tanto, **reciben la memoria como un dato**, igual que reciben el prompt. No la buscan, no la escriben y no dependen de la base de datos.
+
+La excepción es el Executor, y va en el otro sentido: **no recibe memoria en absoluto**. Cuando le llega el turno, la decisión ya está tomada; darle el historial solo le daría material para reinterpretar un procedimiento que no es suyo.
 
 ### El wiring
 
@@ -721,11 +1125,15 @@ En código son tres líneas repartidas en `RouterAgent.atender()`:
 List<Message> memoria = chatMemory.get(sessionId);               // 1. recuperar
 
 String intencion = clasificarIntencion(prompt, memoria);         // 2. usar: clasificar
-String respuesta = searchAgent.responder(prompt, memoria);       //    y responder
+String respuesta = ACCION.equals(intencion)                      //    y responder,
+        ? atenderAccion(prompt, memoria)                         //    por la rama que sea
+        : atenderInformativa(prompt, memoria);
 
 chatMemory.add(sessionId, List.of(new UserMessage(prompt),       // 3. guardar el turno
                                  new AssistantMessage(respuesta)));
 ```
+
+El paso 3 está **fuera** del `if`: da igual si la respuesta salió de Search o de la cadena Process → Executor, el turno se guarda igual. Los agentes reciben la memoria como dato y ninguno la escribe.
 
 Y el agente destino la recibe como una lista de mensajes, que `messages()` coloca antes de la pregunta en el formato nativo de la API:
 
@@ -883,24 +1291,30 @@ sequenceDiagram
     actor U as Empleado
     participant R as Agent Router
     participant P as Agent Process
-    participant M as MCP / MySQL procedimientos
+    participant M as mcp-procesos / MySQL procesos
     participant E as Agent Executor
+    participant L as OpenAI LLM
     participant T as Tools de negocio
     participant A as MySQL auditoría
     participant X as External System
 
     U->>R: "Reserva mis vacaciones"
     R->>R: clasifica intención → ACCIÓN
-    R->>P: solicita procedimiento
-    P->>M: consulta vía MCP
-    M-->>P: definición del procedimiento
+    R->>P: solicita procedimiento (prompt + memoria)
+    P->>M: tools/call listar_procesos
+    M-->>P: catálogo completo
+    P->>P: el LLM elige uno; los pasos se copian del catálogo
     P-->>R: pasos[]
-    R->>E: transfiere pasos[] + execution-id
+    R->>E: ejecutar(Procedimiento con pasos[])
+    E->>L: pasos numerados + esquema de las tools
     loop por cada paso, en orden
-        E->>T: invoca tool (idempotente)
+        L-->>E: tool_call
+        E->>T: invoca la tool
         T-->>E: resultado
+        E->>L: resultado del paso
     end
-    E-->>R: structured output {estado: EXITOSO, pasos[]}
+    L-->>E: informe estructurado
+    E-->>R: {estado: EXITOSO, pasosExitosos[], pasosFallidos[]}
     R->>A: persiste (EXITOSO, PENDIENTE_ENVIO)
     R->>X: envía resultado
     X-->>R: 200 OK
@@ -908,31 +1322,36 @@ sequenceDiagram
     R-->>U: confirmación
 ```
 
+> **Implementado hasta `E-->>R`.** El recorrido `Router → Process → MCP → Executor → tools` funciona de punta a punta ([Agent Process](#agent-process-el-catálogo-por-mcp) y [Agent Executor](#agent-executor-las-tools-y-el-informe)); el `execution-id` y los reintentos por paso, la auditoría y el envío al External System llegan en sus pasos del roadmap. Todo el `loop` del diagrama cabe, en el código, en un único `call()`.
+
 ### Rama de ejecución — fallo en un paso
 
 ```mermaid
 sequenceDiagram
     participant R as Agent Router
     participant E as Agent Executor
+    participant L as OpenAI LLM
     participant T as Tools de negocio
     participant A as MySQL auditoría
     participant X as External System
 
-    R->>E: transfiere pasos[] + execution-id
+    R->>E: ejecutar(Procedimiento con pasos[])
+    E->>L: pasos numerados + esquema de las tools
+    L-->>E: tool_call paso 1
     E->>T: paso 1
     T-->>E: OK
-    E->>T: paso 2
-    T--xE: error
-    Note over E,T: reintento — hasta 3 intentos, 5s de espera
-    E->>T: paso 2 (reintento)
-    T--xE: error
-    E-->>R: structured output {estado: FALLIDO, pasos[]}
+    L-->>E: paso 2: la tool no existe o falla
+    Note over E,T: reintento — 3 intentos, 5s<br/>(política documentada, aún sin implementar)
+    L-->>E: informe: 1 exitoso, 2 y siguientes fallidos
+    E-->>R: {estado: FALLIDO, pasosExitosos[], pasosFallidos[]}
     Note over E,R: nunca lanza excepción:<br/>el fallo viaja como dato
     R->>A: persiste (FALLIDO, PENDIENTE_ENVIO)
     R->>X: envía resultado
     X-->>R: 200 OK
     R->>A: actualiza estado_envio = ENVIADO
 ```
+
+Cuando un paso falla, los que venían detrás **no se intentan**, y aparecen igualmente en `pasosFallidos` con el motivo escrito en su `detalle`. El estado general es `FALLIDO` aunque el modelo diga otra cosa: [lo deriva Java del detalle](#el-informe-no-lo-firma-el-modelo-lo-normaliza-java).
 
 ### Procedimiento inexistente
 
@@ -941,17 +1360,22 @@ sequenceDiagram
     actor U as Empleado
     participant R as Agent Router
     participant P as Agent Process
-    participant M as MCP / MySQL procedimientos
+    participant M as MCP / MySQL procesos
+    participant L as OpenAI LLM
 
     U->>R: "Ejecuta el proceso de reembolso lunar"
     R->>R: clasifica intención → ACCIÓN
     R->>P: solicita procedimiento
-    P->>M: consulta vía MCP
-    M-->>P: sin resultados
+    P->>M: tools/call listar_procesos
+    M-->>P: catálogo completo
+    P->>L: ¿alguno sirve para esto?
+    L-->>P: encontrado = false
     P-->>R: NOT_FOUND
-    R-->>U: "No disponemos de ese procedimiento"
+    R-->>U: "No tengo ningún procedimiento definido para eso"
     Note over R: el Executor NO se invoca:<br/>sin procedimiento no hay ejecución
 ```
+
+Reparar en dónde se decide que no existe: **no en el `WHERE` de una consulta**, sino en el modelo, viendo el catálogo entero. Es lo que permite que `"quiero tomarme unos días"` encuentre `pedir vacaciones` mientras `"reembolso lunar"` no encuentra nada. La otra vía para llegar aquí es que el modelo devuelva un nombre que no está en el catálogo: se trata igual, como `NOT_FOUND` con un `WARN` en el log.
 
 ### Inconsistencia parcial: una decisión deliberada
 
@@ -965,40 +1389,34 @@ Esto es aceptable porque **cada transacción es individual por empleado**. Si la
 
 ### Structured output del Agent Executor
 
-Contrato único que atraviesa `Executor → Router → auditoría → External System`. Spring AI lo materializa directamente en un POJO mediante `ChatClient`.
+Contrato único que atraviesa `Executor → Router → auditoría → External System`. Spring AI lo materializa directamente en un POJO mediante `ChatClient.call().entity(Ejecucion.class)`.
+
+Lo que devuelve hoy el modelo, tal cual:
 
 ```json
 {
-  "executionId": "b3f1a9e4-7c2d-4a11-9f30-8d5e6c0a1b22",
-  "userId": "e.bardalez",
-  "sessionId": "s-77c1f0",
-  "procedimiento": "RESERVA_VACACIONES",
   "estado": "FALLIDO",
-  "pasos": [
-    {
-      "stepIndex": 1,
-      "nombre": "validarSaldoVacaciones",
-      "estado": "EXITOSO",
-      "intentos": 1,
-      "mensaje": null
-    },
-    {
-      "stepIndex": 2,
-      "nombre": "registrarSolicitud",
-      "estado": "FALLIDO",
-      "intentos": 3,
-      "mensaje": "Timeout al conectar con el sistema de RRHH"
-    },
-    {
-      "stepIndex": 3,
-      "nombre": "notificarSupervisor",
-      "estado": "NO_EJECUTADO",
-      "intentos": 0,
-      "mensaje": null
-    }
-  ]
+  "pasosExitosos": [
+    { "paso": 1, "herramienta": "tool-A", "detalle": "Ejecutada correctamente." }
+  ],
+  "pasosFallidos": [
+    { "paso": 2, "herramienta": "tool-D", "detalle": "No existe esa herramienta." },
+    { "paso": 3, "herramienta": "tool-B", "detalle": "No se ejecutó: falló el paso 2." }
+  ],
+  "resumen": "Se completó el primer paso, pero el trámite no pudo terminarse."
 }
 ```
+
+**Dos listas en lugar de una lista con estados.** El estado de un paso es la lista en la que aparece, así que no hace falta un campo que lo repita. El precio es que `NO_EJECUTADO` deja de ser un estado propio: los pasos que no se llegaron a intentar viven en `pasosFallidos` y lo dicen en su `detalle`. Para una demo el intercambio sale a cuenta — el Router pregunta *"¿quedó hecho?"*, no *"¿en qué estado exacto está el paso 3?"*.
+
+| Campo | Quién lo pone | Nota |
+|---|---|---|
+| `estado` | El modelo, **corregido por Java** | Si hay algún paso fallido, es `FALLIDO`, diga lo que diga el modelo |
+| `pasosExitosos`, `pasosFallidos` | El modelo | Nunca `null`: un campo ausente se normaliza a lista vacía |
+| `paso` | El modelo | La posición numerada que se le dio en el prompt, empezando en 1 |
+| `resumen` | El modelo | Lo único de este objeto que puede acabar leyendo el empleado |
+
+Tres campos del contrato **todavía no están**: `executionId`, `userId` y `sessionId`. No los puede escribir el modelo —se los inventaría—, así que entrarán cuando el Router los añada al persistir, junto con la [auditoría](#esquema-de-auditoría) y la [idempotencia](#idempotencia).
 
 ### Esquema de auditoría
 
@@ -1044,11 +1462,22 @@ stateDiagram-v2
 
 ### Estados de un paso
 
-| Estado | Significado |
+| Estado | Significado | Cómo se representa hoy |
+|---|---|---|
+| `EXITOSO` | El paso se completó | Aparece en `pasosExitosos` |
+| `FALLIDO` | Falló tras agotar los reintentos | Aparece en `pasosFallidos`, con el motivo en `detalle` |
+| `NO_EJECUTADO` | No se intentó: un paso anterior falló primero | También en `pasosFallidos`; su `detalle` dice que no se ejecutó y por qué |
+
+### Estado general de una ejecución
+
+Solo dos valores, y es deliberado:
+
+| Estado | Cuándo |
 |---|---|
-| `EXITOSO` | El paso se completó |
-| `FALLIDO` | Falló tras agotar los reintentos |
-| `NO_EJECUTADO` | No se intentó: un paso anterior falló primero |
+| `EXITOSO` | Se ejecutaron **todos** los pasos del procedimiento |
+| `FALLIDO` | Falta al menos uno, aunque sea el último |
+
+No hay `PARCIAL`. Un procedimiento a medias no está hecho, y el detalle de qué sí se hizo ya está en `pasosExitosos`: un tercer valor repartiría la misma información en dos sitios y obligaría al Router a decidir qué significa. La ejecución parcial no se esconde — se cuenta en la respuesta, ver [Inconsistencia parcial](#inconsistencia-parcial-una-decisión-deliberada).
 
 ---
 
@@ -1065,6 +1494,8 @@ Una sola política, aplicada en los dos únicos puntos que la necesitan:
 
 Deliberadamente **sin backoff exponencial, sin cola durable y sin worker de reintento**. Si los 3 intentos de envío se agotan, el registro queda en `PENDIENTE_ENVIO` y la auditoría local cumple su función. Para un sistema de producción el patrón correcto sería un *outbox* con worker desacoplado; aquí sería complejidad sin valor didáctico.
 
+> **Ninguno de los dos puntos está implementado todavía.** El [Agent Executor](#agent-executor-las-tools-y-el-informe) ya ejecuta las tools, pero un paso que falla se marca como fallido sin reintentarlo. Ver [Lo que este agente todavía no hace](#lo-que-este-agente-todavía-no-hace).
+
 ### Idempotencia
 
 **Toda tool debe ser idempotente**, porque todo paso se reintenta. La clave de idempotencia es:
@@ -1076,6 +1507,8 @@ Deliberadamente **sin backoff exponencial, sin cola durable y sin worker de rein
 El `execution-id` lo genera el Router al invocar al Executor.
 
 > **No basta con `session-id`.** Si un empleado solicita vacaciones dos veces en la misma sesión, la segunda solicitud sería descartada como duplicado falso. El `execution-id` distingue ejecuciones; el `step-index`, pasos dentro de una ejecución.
+
+Aún no hay `execution-id`, y es coherente: **sin reintentos, la idempotencia no tiene consumidor**. Una clave que nadie repite no protege de nada, así que las dos piezas llegan juntas. Las tools ficticias actuales son idempotentes por accidente —escriben una línea en el log y no guardan nada—, lo cual no cuenta como diseño.
 
 ### Autenticación e identidad
 
@@ -1105,6 +1538,7 @@ Cada petición transporta, de forma transparente para el usuario:
 | MySQL | 8.x | Una sola instancia: memoria de conversación y auditoría |
 | Qdrant | — | `docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant`. Spring AI usa el puerto **6334** (gRPC) |
 | Clave de API de OpenAI | — | Ver [Configuración](#configuración). Se consume en chat **y en embeddings** |
+| [`mcp-spring`](https://github.com/xxce10xx/mcp-spring) | — | Servidor MCP del catálogo de procedimientos, en el puerto **8082**. Solo lo necesita la rama de acción: sin él, `agents.jar` arranca igual y la rama informativa funciona |
 
 ---
 
@@ -1129,6 +1563,23 @@ Para generar el artefacto ejecutable:
 ./mvnw clean package
 java -jar target/agents-0.0.1-SNAPSHOT.jar
 ```
+
+### Levantar también el servidor MCP
+
+La rama de acción necesita el catálogo de procedimientos, que vive en el otro repositorio. Son dos terminales:
+
+```bash
+# terminal 1 — el catalogo de procedimientos, en el 8082
+git clone git@github.com:xxce10xx/mcp-spring.git
+cd mcp-spring
+./mvnw spring-boot:run
+
+# terminal 2 — los agentes, en el 8081
+cd agents/agents
+./mvnw spring-boot:run
+```
+
+El orden no importa y `agents.jar` **no falla si el otro no está**: el handshake MCP se hace en la primera llamada, no al arrancar ([`initialized: false`](#3-initialized-false-o-el-agente-no-arranca)). Lo que ocurre entonces es que una petición de la rama de acción devuelve `500` con el motivo en el log, mientras la rama informativa sigue respondiendo con normalidad.
 
 ---
 
@@ -1181,6 +1632,22 @@ spring:
           jdbc:
             initialize-schema: always     # crea SPRING_AI_CHAT_MEMORY al arrancar
 
+    # Cliente MCP del Agent Process: consume el servidor mcp-procesos (repositorio mcp-spring)
+    mcp:
+      client:
+        name: agents-mcp-client
+        version: 0.0.1
+        type: sync
+        request-timeout: 20s
+        initialized: false          # handshake en la primera llamada, no al arrancar
+        toolcallback:
+          enabled: false            # las tools MCP no se ofrecen al LLM: se llaman con código
+        streamable-http:
+          connections:
+            procesos:
+              url: http://localhost:8082    # solo el origen
+              endpoint: /mcp                # la ruta del protocolo, aparte
+
     vectorstore:
       qdrant:
         # OJO: Qdrant no se configura con una URL, sino con host + puerto gRPC
@@ -1205,7 +1672,7 @@ sprintai:
     cargar-documentos: false  # a true solo para (re)indexar resources/documentos/*.md
 ```
 
-**Lo que hay que preparar** son tres cosas: las variables de entorno de la tabla anterior, una base de datos MySQL llamada `sprintai` (la tabla la crea la aplicación) y un Qdrant escuchando en el 6334. Los tests no necesitan ninguna de las dos: tienen su propio `src/test/resources/application.yaml` con H2 en memoria y Qdrant desactivado.
+**Lo que hay que preparar** son cuatro cosas: las variables de entorno de la tabla anterior, una base de datos MySQL llamada `sprintai` (las tablas las crean las aplicaciones), un Qdrant escuchando en el 6334 y —solo para la rama de acción— el servidor [`mcp-spring`](https://github.com/xxce10xx/mcp-spring) en el 8082. Los tests no necesitan ninguna: tienen su propio `src/test/resources/application.yaml` con H2 en memoria, Qdrant desactivado y la conexión MCP declarada pero nunca usada.
 
 > **Tras el primer arranque, pon `cargar-documentos` en `false`.** El cargador no controla qué está ya indexado, así que cada arranque duplica los fragmentos y vuelve a pagar los embeddings.
 
@@ -1232,8 +1699,6 @@ sprintai:
     espera: 5s
   external-system:
     url: ${EXTERNAL_SYSTEM_URL}
-  mcp:
-    procedimientos-url: ${MCP_URL}
 ```
 
 ### Dependencias
@@ -1246,6 +1711,7 @@ Presentes en `pom.xml`:
 | `spring-ai-starter-model-openai` | Cliente de OpenAI para los cuatro agentes: chat y embeddings |
 | `spring-ai-starter-vector-store-qdrant` | `VectorStore` sobre Qdrant, la base vectorial del Agent Search |
 | `spring-ai-vector-store-advisor` | Aporta `QuestionAnswerAdvisor`, el advisor que hace el RAG |
+| `spring-ai-starter-mcp-client` | Cliente MCP del Agent Process: `McpSyncClient` y la autoconfiguración de las conexiones |
 | `spring-ai-starter-model-chat-memory-repository-jdbc` | `JdbcChatMemoryRepository` y el DDL de la tabla de memoria |
 | `mysql-connector-j` | Driver de MySQL |
 | `spring-boot-starter-test` | Pruebas |
@@ -1253,11 +1719,12 @@ Presentes en `pom.xml`:
 
 > El `QuestionAnswerAdvisor` viaja en un artefacto **aparte** del starter de Qdrant: el starter da el almacén, el advisor da la integración con el `ChatClient`. Sin el segundo, `QuestionAnswerAdvisor` no compila.
 
+> El starter del cliente MCP arrastra `spring-ai-autoconfigure-mcp-client-common` y `-httpclient`: el primero crea los `McpSyncClient` a partir de las conexiones declaradas, el segundo aporta el transporte HTTP. No hace falta declarar el SDK de MCP aparte.
+
 Previstas, se añadirán en los pasos correspondientes:
 
 | Artefacto | Habilita |
 |---|---|
-| `spring-ai-starter-mcp-client` | Acceso de Agent Process a procedimientos vía MCP |
 | `spring-boot-starter-data-jpa` | Persistencia de auditoría |
 
 ---
@@ -1301,18 +1768,40 @@ El campo `intencion` no forma parte del contrato definitivo: está expuesto **a 
 
 ### Respuesta — rama de ejecución
 
-Todavía no existe. Hoy el Router reconoce la intención y ahí se detiene: la respuesta viene a `null` porque el Agent Process, que es quien debe producirla, llega en el paso 10.
+El Router clasifica `ACCION`, Process consulta el catálogo por MCP, el LLM elige el procedimiento y el Executor lo ejecuta:
 
 ```json
 {
   "prompt": "Reserva mis vacaciones del 20 al 24 de octubre",
   "intencion": "ACCION",
-  "respuesta": null,
+  "respuesta": "Listo, ya tramité «pedir vacaciones». Se completaron los dos pasos del trámite sin problemas.\n\nPasos ejecutados:\n1. tool-A — Ejecutada correctamente.\n2. tool-B — Ejecutada correctamente.",
   "sessionId": "s-77c1f0"
 }
 ```
 
-La forma prevista, cuando Process y Executor estén en su sitio:
+En la consola de la aplicación se ve la otra mitad, que es la que prueba que las tools se ejecutaron de verdad:
+
+```text
+INFO  c.b.agents.executor.ExecutorAgent    : Executor: arranca 'pedir vacaciones' con 2 pasos: tool-A -> tool-B
+INFO  c.b.a.executor.HerramientasFicticias : >>> tool-A ejecutada
+INFO  c.b.a.executor.HerramientasFicticias : >>> tool-B ejecutada
+INFO  c.b.agents.executor.ExecutorAgent    : Executor: 'pedir vacaciones' termino con estado EXITOSO (2 pasos correctos, 0 fallidos)
+```
+
+Los pasos que se ejecutaron salieron de la fila de `MySQL.procesos`, no del modelo: el LLM solo eligió **cuál** de los procedimientos aplica y en qué momento invocar cada tool. Necesita el servidor MCP levantado en el 8082; si no lo está, la petición devuelve `500` y el log dice por qué.
+
+Cuando un paso no se puede ejecutar —por ejemplo, si la `secuencia` de la base de datos nombra una tool que no existe— la respuesta lo dice sin adornos:
+
+```json
+{
+  "prompt": "Ejecuta el alta de proveedor",
+  "intencion": "ACCION",
+  "respuesta": "No pude completar «alta de proveedor». El primer paso quedó hecho, pero el trámite no pudo terminarse.\n\nSí quedó hecho:\n1. tool-A — Ejecutada correctamente.\n\nNo se pudo completar:\n2. tool-D — No existe esa herramienta.",
+  "sessionId": "s-77c1f0"
+}
+```
+
+La forma prevista del contrato, cuando la auditoría esté en su sitio:
 
 ```json
 {
@@ -1326,6 +1815,19 @@ La forma prevista, cuando Process y Executor estén en su sitio:
 
 ### Respuesta — procedimiento inexistente
 
+Lo que devuelve hoy, cuando ningún procedimiento del catálogo encaja:
+
+```json
+{
+  "prompt": "Ejecuta el proceso de reembolso lunar",
+  "intencion": "ACCION",
+  "respuesta": "No tengo ningún procedimiento definido para eso, así que no puedo tramitarlo. Si crees que debería existir, escríbele a la mesa de ayuda.",
+  "sessionId": "s-77c1f0"
+}
+```
+
+Y la forma prevista del contrato definitivo:
+
 ```json
 {
   "tipo": "EJECUCION",
@@ -1335,7 +1837,7 @@ La forma prevista, cuando Process y Executor estén en su sitio:
 }
 ```
 
-> Los dos últimos contratos son la forma prevista: la rama de ejecución todavía no existe.
+> Los campos `tipo`, `executionId` y `estado` son la forma prevista; hoy la respuesta HTTP sigue siendo el mismo `RouterResponse` de la rama informativa, con `intencion` expuesta para verlo en clase.
 
 ### Respuesta — bloqueo de un guardrail
 
@@ -1376,11 +1878,14 @@ La construcción es **incremental**: un componente por iteración.
 | 7 | Clasificación tipada de intención (enum en lugar de constantes `String`) | ⬜ Pendiente |
 | 8 | Extracción del claim `user-id` desde el token | ⬜ Pendiente |
 | 9 | Persistencia: esquema de auditoría | ⬜ Pendiente |
-| 10 | Agent Process vía MCP | ⬜ Pendiente |
-| 11 | Agent Executor, tools e idempotencia | ⬜ Pendiente |
-| 12 | Tool de envío al External System | ⬜ Pendiente |
+| 10 | Agent Process vía MCP + servidor [`mcp-spring`](https://github.com/xxce10xx/mcp-spring) | ✅ Completado |
+| 11 | Agent Executor con tres tools ficticias vía *tool calling* | ✅ Completado |
+| 12 | Reintentos por paso e idempotencia `{execution-id}:{step-index}` | ⬜ Pendiente |
+| 13 | Tool de envío al External System | ⬜ Pendiente |
 
-La rama informativa está cerrada de punta a punta: entra una pregunta, se clasifica, se recupera de Qdrant, se responde con memoria de la conversación. La rama de acción reconoce la intención pero aún no ejecuta nada.
+Las dos ramas están cerradas de punta a punta. La informativa: entra una pregunta, se clasifica, se recupera de Qdrant, se responde con memoria de la conversación. La de acción: se clasifica, se consulta el catálogo real por MCP, el LLM elige el procedimiento y el Executor ejecuta sus tools en orden, devolviendo un informe estructurado.
+
+Lo que queda no es funcionalidad para el empleado, es **rastro y robustez**: la auditoría (paso 9), los reintentos con su idempotencia (12) y el envío al sistema externo (13). Hoy una ejecución ocurre y no deja constancia más allá del log.
 
 ### Fuera de alcance
 
@@ -1419,6 +1924,22 @@ Decisiones tomadas conscientemente, no omisiones:
         │   │   │   ├── SearchAgent.java         # una llamada al ChatClient, nada más
         │   │   │   ├── SearchChatClientConfig.java  # RAG + canary
         │   │   │   └── DocumentosLoader.java    # indexa el corpus al arrancar
+        │   │   ├── process/
+        │   │   │   ├── ProcessAgent.java        # el LLM elige, el codigo copia los pasos
+        │   │   │   ├── ProcessChatClientConfig.java # ChatClient: system prompt + canary
+        │   │   │   ├── CatalogoProcesos.java    # cliente MCP + traduccion de la secuencia
+        │   │   │   ├── Proceso.java             # copia del contrato del servidor MCP
+        │   │   │   └── dto/
+        │   │   │       ├── Procedimiento.java   # salida hacia el Router: pasos[] o NOT_FOUND
+        │   │   │       └── Eleccion.java        # structured output del LLM
+        │   │   ├── executor/
+        │   │   │   ├── ExecutorAgent.java       # ejecuta los pasos y devuelve el informe
+        │   │   │   ├── ExecutorChatClientConfig.java # ChatClient: system prompt + canary + tools
+        │   │   │   ├── HerramientasFicticias.java   # @Tool: tool-A, tool-B, tool-C
+        │   │   │   └── dto/
+        │   │   │       ├── Ejecucion.java       # structured output: dos listas y un estado
+        │   │   │       ├── PasoEjecutado.java   # un paso, con su numero y su detalle
+        │   │   │       └── EstadoEjecucion.java # EXITOSO | FALLIDO
         │   │   ├── memory/
         │   │   │   └── ChatMemoryConfig.java    # ChatMemory: almacén + política
         │   │   └── guardrail/
@@ -1437,6 +1958,10 @@ Decisiones tomadas conscientemente, no omisiones:
         │           ├── router-system.st         # rol, criterio, {canary}
         │           ├── router-user.st           # plantilla con {prompt}
         │           ├── search-system.st         # responde solo con el contexto, {canary}
+        │           ├── process-system.st        # elige un procedimiento del catalogo, {canary}
+        │           ├── process-user.st          # plantilla con {catalogo} y {prompt}
+        │           ├── executor-system.st       # ejecuta en orden y reporta, {canary}
+        │           ├── executor-user.st         # plantilla con {procedimiento}, {pasos}, {herramientas}
         │           ├── topic-guardrail-system.st
         │           └── topic-guardrail-user.st
         └── test/
@@ -1447,10 +1972,21 @@ Decisiones tomadas conscientemente, no omisiones:
             │   ├── router/
             │   │   ├── ChatMemoryTest.java            # memoria contra H2, sin LLM
             │   │   └── RouterPromptTemplateTest.java
+            │   ├── process/
+            │   │   ├── CatalogoProcesosTest.java      # orden de los pasos, sin MCP
+            │   │   └── ProcessPromptTemplateTest.java
+            │   ├── executor/
+            │   │   ├── HerramientasFicticiasTest.java # los nombres de las tools, por reflexion
+            │   │   ├── ExecutorAgentTest.java         # el invariante: no se entra sin Process
+            │   │   ├── ExecutorPromptTemplateTest.java
+            │   │   └── dto/
+            │   │       └── EjecucionTest.java         # normalizacion del informe del LLM
             │   └── search/
             │       └── DocumentosTest.java            # leer + trocear, sin Qdrant
             └── resources/
-                └── application.yaml                   # H2 y Qdrant desactivado
+                └── application.yaml                   # H2, Qdrant y MCP sin contactar
 ```
 
-Cada agente vive en su propio paquete bajo `com.bardalez.agents`, con su agente, su configuración de `ChatClient` y sus prompts. A medida que se incorporen, se añadirán `process` y `executor` con la misma estructura interna. `memory` y `guardrail` son la excepción deliberada: son transversales, los usa más de un agente.
+Cada agente vive en su propio paquete bajo `com.bardalez.agents`, con su agente, su configuración de `ChatClient` y sus prompts: los cuatro están ya en su sitio y siguen la misma estructura interna. `memory` y `guardrail` son la excepción deliberada: son transversales, los usa más de un agente.
+
+El quinto paquete de la arquitectura no está aquí: el catálogo de procedimientos es un repositorio aparte, [`mcp-spring`](https://github.com/xxce10xx/mcp-spring), con su propio `pom.xml`, su propia base de datos y su propio [README](https://github.com/xxce10xx/mcp-spring#readme). Lo único que comparten los dos proyectos es el JSON que viaja por el protocolo.

@@ -26,6 +26,22 @@ spring:
         # false -> no se conecta a Qdrant al arrancar el contexto
         initialize-schema: false
 
+    # La conexion MCP se declara para que el contexto tenga su McpSyncClient, pero NADIE la usa
+    # durante los tests: con initialized: false no hay handshake al arrancar, y con toolcallback
+    # desactivado nadie pide el catalogo de herramientas. Ningun test llama al servidor MCP, asi que
+    # ./mvnw test sigue sin necesitar mcp-procesos levantado.
+    mcp:
+      client:
+        type: sync
+        initialized: false
+        toolcallback:
+          enabled: false
+        streamable-http:
+          connections:
+            procesos:
+              url: http://localhost:8082
+              endpoint: /mcp
+
 sprintai:
   search:
     top-k: 5

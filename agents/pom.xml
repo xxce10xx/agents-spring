@@ -53,6 +53,12 @@
 			<artifactId>spring-ai-vector-store-advisor</artifactId>
 		</dependency>
 
+		<!-- Cliente MCP del Agent Process: habla con el servidor mcp-procesos -->
+		<dependency>
+			<groupId>org.springframework.ai</groupId>
+			<artifactId>spring-ai-starter-mcp-client</artifactId>
+		</dependency>
+
 		<!-- Memoria de conversacion persistida en MySQL: aporta JdbcChatMemoryRepository -->
 		<dependency>
 			<groupId>org.springframework.ai</groupId>

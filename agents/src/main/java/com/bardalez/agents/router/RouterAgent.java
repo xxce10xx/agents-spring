@@ -2,8 +2,15 @@ package com.bardalez.agents.router;
 
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
+import com.bardalez.agents.executor.ExecutorAgent;
+import com.bardalez.agents.executor.dto.Ejecucion;
+import com.bardalez.agents.executor.dto.EstadoEjecucion;
+import com.bardalez.agents.executor.dto.PasoEjecutado;
 import com.bardalez.agents.guardrail.TopicGuardrail;
+import com.bardalez.agents.process.ProcessAgent;
+import com.bardalez.agents.process.dto.Procedimiento;
 import com.bardalez.agents.router.dto.Resultado;
 import com.bardalez.agents.search.SearchAgent;
 
@@ -49,17 +56,23 @@ public class RouterAgent {
     private final PromptTemplate userPromptTemplate;
     private final TopicGuardrail topicGuardrail;
     private final SearchAgent searchAgent;
+    private final ProcessAgent processAgent;
+    private final ExecutorAgent executorAgent;
     private final ChatMemory chatMemory;
 
     public RouterAgent(ChatClient routerChatClient,
                        @Value("classpath:prompts/router-user.st") Resource userPrompt,
                        TopicGuardrail topicGuardrail,
                        SearchAgent searchAgent,
+                       ProcessAgent processAgent,
+                       ExecutorAgent executorAgent,
                        ChatMemory chatMemory) {
         this.chatClient = routerChatClient;
         this.userPromptTemplate = new PromptTemplate(userPrompt);
         this.topicGuardrail = topicGuardrail;
         this.searchAgent = searchAgent;
+        this.processAgent = processAgent;
+        this.executorAgent = executorAgent;
         this.chatMemory = chatMemory;
     }
 
@@ -79,22 +92,97 @@ public class RouterAgent {
 
         String intencion = clasificarIntencion(prompt, memoria);
 
-        if (ACCION.equals(intencion)) {
-            // TODO: enrutar al Agent Process, que recuperara la definicion del procedimiento.
-            log.debug("Rama de accion: el Agent Process todavia no esta implementado");
-            return new Resultado(intencion, null);
-        }
+        // Las dos ramas reciben lo mismo: el prompt y la memoria ya recuperada. Ninguno de los dos
+        // agentes conoce la sesion ni toca la base de datos de conversacion.
+        String respuesta = ACCION.equals(intencion)
+                ? atenderAccion(prompt, memoria)
+                : atenderInformativa(prompt, memoria);
 
-        // Rama informativa: se delega en Search, que hace RAG sobre la documentacion corporativa.
-        // Se le pasa la pregunta y la memoria ya recuperada; Search no toca la base de datos.
-        log.debug("Rama informativa: se enruta a Search");
-        String respuesta = searchAgent.responder(prompt, memoria);
-
-        // Y el Router cierra el turno guardandolo. Lo que queda en MySQL es la conversacion real:
-        // la pregunta tal como la escribio el empleado y la respuesta tal como la va a leer.
+        // Y el Router cierra el turno guardandolo, venga de donde venga la respuesta. Lo que queda en
+        // MySQL es la conversacion real: la pregunta tal como la escribio el empleado y la respuesta
+        // tal como la va a leer. Que el guardado este aqui, fuera del if, es justo el motivo de que la
+        // memoria sea del Router: los dos agentes se benefician sin saber que existe.
         chatMemory.add(sessionId, List.of(new UserMessage(prompt), new AssistantMessage(respuesta)));
 
         return new Resultado(intencion, respuesta);
+    }
+
+    /**
+     * Rama informativa: se delega en Search, que hace RAG sobre la documentacion corporativa.
+     */
+    private String atenderInformativa(String prompt, List<Message> memoria) {
+        log.debug("Rama informativa: se enruta a Search");
+        return searchAgent.responder(prompt, memoria);
+    }
+
+    /**
+     * Rama de accion: dos agentes en cadena. Process dice <em>que</em> hay que hacer y Executor lo
+     * hace.
+     *
+     * <p>Ninguno de los dos devuelve texto: Process devuelve un {@link Procedimiento} y Executor un
+     * {@link Ejecucion}. Redactar la respuesta al empleado es trabajo del Router, aqui abajo, en
+     * {@link #redactar}: los agentes especializados devuelven datos y el hub decide como se cuentan.
+     */
+    private String atenderAccion(String prompt, List<Message> memoria) {
+        log.debug("Rama de accion: se enruta a Process");
+        Procedimiento procedimiento = processAgent.resolver(prompt, memoria);
+
+        if (!procedimiento.encontrado()) {
+            // No hay reintento ni fallback a Search: si el procedimiento no existe, no existe. Y sobre
+            // todo, se sale por aqui: el Executor no se llega a nombrar.
+            log.debug("Process no encontro ningun procedimiento aplicable");
+            return "No tengo ningún procedimiento definido para eso, así que no puedo tramitarlo. "
+                    + "Si crees que debería existir, escríbele a la mesa de ayuda.";
+        }
+
+        log.debug("Process resolvio el procedimiento '{}' con {} pasos",
+                procedimiento.proceso(), procedimiento.pasos().size());
+
+        // La unica invocacion al Executor de todo el proyecto, y esta dentro de la rama en la que
+        // Process encontro un procedimiento: es el invariante de seguridad escrito como control de
+        // flujo. Lo que se le pasa es el procedimiento entero, con su secuencia de pasos ya copiada
+        // del catalogo, asi que el Executor no elige que ejecutar; solo ejecuta.
+        Ejecucion ejecucion = executorAgent.ejecutar(procedimiento);
+
+        return redactar(procedimiento, ejecucion);
+    }
+
+    /**
+     * Convierte el informe del Executor en la respuesta que lee el empleado.
+     *
+     * <p>El informe es un JSON con dos listas y un estado; lo que necesita el empleado es saber si su
+     * tramite quedo hecho. Los dos casos se cuentan distinto a proposito: un procedimiento a medias no
+     * se puede resumir con un "listo", porque lo importante es justo lo que falto.
+     */
+    private String redactar(Procedimiento procedimiento, Ejecucion ejecucion) {
+        if (ejecucion.estado() == EstadoEjecucion.EXITOSO) {
+            return """
+                    Listo, ya tramité «%s». %s
+
+                    Pasos ejecutados:
+                    %s""".formatted(
+                    procedimiento.proceso(),
+                    ejecucion.resumen(),
+                    listar(ejecucion.pasosExitosos()));
+        }
+
+        String pendientes = ejecucion.pasosFallidos().isEmpty()
+                ? ""
+                : "\n\nNo se pudo completar:\n" + listar(ejecucion.pasosFallidos());
+
+        String hechos = ejecucion.pasosExitosos().isEmpty()
+                ? ""
+                : "\n\nSí quedó hecho:\n" + listar(ejecucion.pasosExitosos());
+
+        return "No pude completar «%s». %s%s%s".formatted(
+                procedimiento.proceso(), ejecucion.resumen(), hechos, pendientes);
+    }
+
+    /** Una linea por paso, con su numero, su herramienta y el detalle que escribio el Executor. */
+    private String listar(List<PasoEjecutado> pasos) {
+        return pasos.stream()
+                .map(paso -> "%d. %s — %s".formatted(paso.paso(), paso.herramienta(), paso.detalle()))
+                .collect(Collectors.joining("\n"));
     }
 
     /**

@@ -35,6 +35,33 @@ spring:
             # Con el valor por defecto (embedded) MySQL no se inicializaria.
             initialize-schema: always
 
+    # Cliente MCP del Agent Process: consume el servidor mcp-procesos (proyecto ../mcp), que es el
+    # dueno del catalogo de procedimientos. El agente no consulta esa tabla por JDBC, la pide por
+    # protocolo.
+    mcp:
+      client:
+        name: agents-mcp-client
+        version: 0.0.1
+        type: sync
+        request-timeout: 20s
+        # false -> el handshake se hace en la PRIMERA llamada, no al arrancar.
+        # Con true (el valor por defecto), Spring AI llama a initialize() al crear el bean y
+        # agents.jar no arranca si mcp-procesos esta caido: un servidor de procedimientos apagado
+        # dejaria sin servicio tambien a la rama informativa, que no lo necesita para nada.
+        initialized: false
+        toolcallback:
+          # false -> las herramientas del servidor MCP NO se ofrecen al LLM como tools.
+          # El Agent Process no necesita que el modelo decida si consulta el catalogo: SIEMPRE lo
+          # necesita, asi que lo pide con codigo. Ver CatalogoProcesos.
+          enabled: false
+        streamable-http:
+          connections:
+            # El nombre de la conexion (procesos) es libre: solo aparece en los logs.
+            procesos:
+              # Solo el origen. La ruta del protocolo va aparte, en endpoint.
+              url: http://localhost:8082
+              endpoint: /mcp
+
     vectorstore:
       qdrant:
         # OJO: Qdrant en Spring AI no se configura con una URL, sino con host + puerto gRPC.
