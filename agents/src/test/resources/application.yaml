@@ -1,5 +1,8 @@
-# Configuracion solo para los tests: H2 en memoria en lugar de MySQL, para que no haga falta
-# tener la base de datos levantada al ejecutar ./mvnw test.
+# Configuracion solo para los tests. Este fichero SUSTITUYE al de src/main/resources, no lo
+# complementa, asi que tiene que declarar todo lo que el contexto necesita para arrancar.
+#
+# La idea es que ./mvnw test no dependa de ninguna infraestructura: H2 en lugar de MySQL, y Qdrant
+# declarado pero sin tocarlo (no se crea la coleccion ni se indexan documentos).
 spring:
   datasource:
     url: jdbc:h2:mem:sprintai;DB_CLOSE_DELAY=-1
@@ -15,3 +18,17 @@ spring:
         repository:
           jdbc:
             initialize-schema: always
+    vectorstore:
+      qdrant:
+        host: localhost
+        port: 6334
+        collection-name: documentacion-corporativa
+        # false -> no se conecta a Qdrant al arrancar el contexto
+        initialize-schema: false
+
+sprintai:
+  search:
+    top-k: 5
+    umbral-similitud: 0.5
+    # false -> no se indexa nada, no hace falta un Qdrant levantado
+    cargar-documentos: false

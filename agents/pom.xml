@@ -41,6 +41,18 @@
 			<artifactId>spring-ai-starter-model-openai</artifactId>
 		</dependency>
 
+		<!-- Base vectorial del Agent Search -->
+		<dependency>
+			<groupId>org.springframework.ai</groupId>
+			<artifactId>spring-ai-starter-vector-store-qdrant</artifactId>
+		</dependency>
+
+		<!-- Aporta QuestionAnswerAdvisor: el advisor que hace RAG -->
+		<dependency>
+			<groupId>org.springframework.ai</groupId>
+			<artifactId>spring-ai-vector-store-advisor</artifactId>
+		</dependency>
+
 		<!-- Memoria de conversacion persistida en MySQL: aporta JdbcChatMemoryRepository -->
 		<dependency>
 			<groupId>org.springframework.ai</groupId>

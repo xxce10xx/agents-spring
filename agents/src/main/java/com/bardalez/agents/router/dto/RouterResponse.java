@@ -1,12 +1,15 @@
 package com.bardalez.agents.router.dto;
 
 /**
- * Respuesta de prueba del Router. Verifica que la conexion con el LLM funciona; el contrato
- * definitivo de la API se definira cuando el Router enrute hacia los demas agentes.
+ * Respuesta de la API.
+ *
+ * <p>{@code intencion} no es informacion que el empleado necesite: se devuelve para que en clase se
+ * vea por que rama paso la peticion. Un cliente real solo leeria {@code respuesta}.
  *
  * @param prompt    mensaje original del empleado
- * @param intencion clasificacion devuelta por el LLM
- * @param sessionId identificador de sesion recibido en la cabecera, si vino
+ * @param intencion clasificacion del Router, {@code INFORMATIVA} o {@code ACCION}
+ * @param respuesta texto en lenguaje natural para el empleado
+ * @param sessionId identificador de la conversacion usado para la memoria
  */
-public record RouterResponse(String prompt, String intencion, String sessionId) {
+public record RouterResponse(String prompt, String intencion, String respuesta, String sessionId) {
 }

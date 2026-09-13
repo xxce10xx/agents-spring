@@ -21,6 +21,11 @@ spring:
           model: gpt-4o-mini
           # temperatura 0 -> el Router es un clasificador, no debe ser creativo
           temperature: 0.0
+      embedding:
+        options:
+          # Modelo que convierte texto en vectores, tanto al indexar como al buscar.
+          # Debe ser el mismo en ambos lados o las distancias no significan nada.
+          model: text-embedding-3-small
 
     chat:
       memory:
@@ -30,9 +35,49 @@ spring:
             # Con el valor por defecto (embedded) MySQL no se inicializaria.
             initialize-schema: always
 
+    vectorstore:
+      qdrant:
+        # OJO: Qdrant en Spring AI no se configura con una URL, sino con host + puerto gRPC.
+        # El host es SOLO el nombre de maquina: sin https://, sin barra final. Spring AI
+        # se lo pasa tal cual a gRPC, que no sabe interpretar un esquema de URL.
+        #
+        # Qdrant local (docker):  QDRANT_HOST=localhost                    (el resto, por defecto)
+        # Qdrant Cloud:           QDRANT_HOST=xxxx.aws.cloud.qdrant.io
+        #                         QDRANT_TLS=true
+        #                         QDRANT_API_KEY=<la clave del cluster>
+        #                         el puerto sigue siendo 6334, TLS no lo cambia
+        #
+        # Van por variable de entorno porque este fichero esta en un repositorio publico:
+        # sin definir nada, la aplicacion apunta al Qdrant local.
+        host: ${QDRANT_HOST:localhost}
+        port: ${QDRANT_PORT:6334}
+        use-tls: ${QDRANT_TLS:false}
+        api-key: ${QDRANT_API_KEY:}
+        collection-name: documentacion-corporativa
+        # Crea la coleccion al arrancar si no existe, con las dimensiones del modelo
+        # de embeddings. Ponlo en false si la coleccion ya existe.
+        initialize-schema: true
+
 server:
   port: 8081
 
 logging:
   level:
     com.bardalez.agents: DEBUG
+
+# Parametros propios del proyecto (no son de Spring AI)
+sprintai:
+  search:
+    # RAG: cuantos fragmentos se recuperan y con que parecido minimo.
+    top-k: 5
+    # Similitud coseno minima para que un fragmento entre en el prompt: por debajo se descarta,
+    # porque es mejor no responder que responder con documentacion que no venia al caso.
+    #
+    # 0.5 esta medido, no estimado: es el hueco entre lo que puntua una pregunta que si esta en la
+    # documentacion y una que no. Ojo con leerlo como "50% de coincidencia" y subirlo a 0.6 o 0.7:
+    # con estos embeddings ni el fragmento correcto llega ahi, y el agente deja de encontrar todo.
+    umbral-similitud: 0.5
+    # Carga los documentos de resources/documentos/ en Qdrant al arrancar.
+    # Solo se pone en true para (re)indexar: borra antes la coleccion, arranca una vez y vuelve a
+    # false, porque el loader no comprueba si los documentos ya estaban y los duplicaria.
+    cargar-documentos: false

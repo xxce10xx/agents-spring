@@ -3,6 +3,7 @@ package com.bardalez.agents.router;
 import java.util.List;
 import java.util.Map;
 
+import com.bardalez.agents.router.dto.Resultado;
 import com.bardalez.agents.router.dto.RouterRequest;
 import com.bardalez.agents.router.dto.RouterResponse;
 
@@ -17,8 +18,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * Punto de entrada REST del sistema. Endpoint de prueba: solo comprueba que el Router llega al
- * LLM y devuelve la intencion clasificada.
+ * Punto de entrada REST del sistema: recibe el mensaje del empleado, lo entrega al Router y
+ * devuelve lo que el Router resolvio.
  *
  * <p>La cabecera {@code X-Session-Id} identifica la conversacion: dos peticiones con el mismo valor
  * comparten memoria, con valores distintos no se ven entre si. Si el cliente no la manda se usa
@@ -42,16 +43,16 @@ public class RouterController {
     public RouterResponse chat(@RequestBody RouterRequest request,
                                @RequestHeader(value = "X-Session-Id", required = false) String sessionId) {
         String sesion = (sessionId == null || sessionId.isBlank()) ? SESION_POR_DEFECTO : sessionId;
-        String intencion = routerAgent.clasificarIntencion(request.prompt(), sesion);
-        return new RouterResponse(request.prompt(), intencion, sesion);
+        Resultado resultado = routerAgent.atender(request.prompt(), sesion);
+        return new RouterResponse(request.prompt(), resultado.intencion(), resultado.respuesta(), sesion);
     }
 
     /**
      * Endpoint de apoyo para la clase: devuelve el historial que la memoria reenviara al modelo en
      * la siguiente llamada de esa sesion.
      *
-     * <p>Existe porque el Router es un clasificador: responde una sola palabra, asi que la memoria
-     * no se puede comprobar leyendo su respuesta. Aqui se ve directamente.
+     * <p>La memoria ya se nota en las respuestas de Search, pero verla en crudo ahorra explicaciones:
+     * es exactamente lo que el Router recupero y volvera a reenviar.
      */
     @GetMapping("/chat/{sessionId}/memoria")
     public List<Map<String, String>> memoria(@PathVariable String sessionId) {
