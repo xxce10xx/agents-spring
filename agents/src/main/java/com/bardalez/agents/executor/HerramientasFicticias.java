@@ -57,6 +57,7 @@ public class HerramientasFicticias {
                     en la posicion que indique esa secuencia.""")
     public String toolB() {
         log.info(">>> tool-B ejecutada");
+        //throw new  RuntimeException();
         return "tool-B ejecutada correctamente";
     }
 

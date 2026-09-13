@@ -28,6 +28,7 @@ El Agent Process de este repositorio es **cliente** del otro: no consulta esa ta
 - [Agent Search: RAG sobre Qdrant](#agent-search-rag-sobre-qdrant)
 - [Agent Process: el catálogo por MCP](#agent-process-el-catálogo-por-mcp)
 - [Agent Executor: las tools y el informe](#agent-executor-las-tools-y-el-informe)
+- [Auditoría y envío: el rastro de la ejecución](#auditoría-y-envío-el-rastro-de-la-ejecución)
 - [Memoria de conversación](#memoria-de-conversación)
 - [Diagramas de secuencia](#diagramas-de-secuencia)
 - [Contratos de datos](#contratos-de-datos)
@@ -55,7 +56,7 @@ graph LR
         S["Agent Search"]
         P["Agent Process"]
         E["Agent Executor"]
-        T{{"tool: envío"}}
+        T{{"tool-enviar-ejecucion"}}
         TA{{"tool A"}}
         TB{{"tool B"}}
         TC{{"tool C"}}
@@ -64,7 +65,7 @@ graph LR
     QD[("Qdrant<br/>vectorial")]
     MCPS["mcp-procesos.jar :8082<br/>servidor MCP · otro repositorio"]
     DBP[("MySQL<br/>procesos")]
-    DBA[("MySQL<br/>auditoría")]
+    DBA[("MySQL<br/>tabla ejecucion")]
     EXT(["External System<br/>reportería"])
 
     Actor -->|"POST /chat"| LA
@@ -114,8 +115,10 @@ Actor ──HTTP POST──→ [Lambda Authorizer: valida token] ──→ agent
                                                           structured output → POJO
                                                                     ↓
                                                                  ROUTER
-                                                    1. MySQL.auditoria (estado_ejecucion + estado_envio)
-                                                    2. tool → External System (3 reintentos × 5s)
+                                                    1. MySQL.ejecucion (estado_ejecucion + estado_envio)
+                                                    2. tool-enviar-ejecucion → External System
+                                                       (reintentos del envío: pendientes)
+                                                    3. redacta la respuesta al empleado
 ```
 
 ### Stack
@@ -128,7 +131,7 @@ Actor ──HTTP POST──→ [Lambda Authorizer: valida token] ──→ agent
 | Build | Maven | Wrapper incluido (`mvnw`) |
 | Modelo de lenguaje | OpenAI | `gpt-4o-mini` para chat, `text-embedding-3-small` para embeddings |
 | Base vectorial | Qdrant | Consumida por Agent Search vía gRPC (6334) |
-| Base relacional | MySQL | Una instancia, dos esquemas |
+| Base relacional | MySQL | Una instancia: memoria de conversación y auditoría de ejecuciones |
 | Coordenadas Maven | `com.bardalez:agents` | `0.0.1-SNAPSHOT` |
 
 ---
@@ -137,7 +140,7 @@ Actor ──HTTP POST──→ [Lambda Authorizer: valida token] ──→ agent
 
 | Componente | Responsabilidad | Lee / Escribe | Efectos secundarios |
 |---|---|---|---|
-| **Agent Router** | Clasificar intención, orquestar, recordar, persistir y publicar | Lee y escribe `MySQL.memoria` y `MySQL.auditoria`, llama al External System | Sí |
+| **Agent Router** | Clasificar intención, orquestar, recordar, persistir y publicar | Lee y escribe `MySQL.SPRING_AI_CHAT_MEMORY` y `MySQL.ejecucion`, llama al External System | Sí |
 | **Agent Search** | Responder preguntas desde documentación corporativa | Lee Qdrant | No (solo lectura) |
 | **Agent Process** | Recuperar la definición de un procedimiento | Lee `MySQL.procesos` vía MCP (otro proceso) | No (solo lectura) |
 | **Agent Executor** | Ejecutar las tools en el orden que dicta el procedimiento | Invoca tools de negocio | Sí |
@@ -156,6 +159,8 @@ Responsabilidades:
 6. **Publicar** el resultado al External System mediante una tool.
 
 Nunca ejecuta lógica de negocio propia.
+
+De los seis puntos, el 1 es el único pendiente: no hay autenticación todavía, así que no hay claim que extraer. Los dos últimos son la última pieza de la rama de acción — los detalles, en [Auditoría y envío: el rastro de la ejecución](#auditoría-y-envío-el-rastro-de-la-ejecución).
 
 ### Agent Search
 
@@ -966,6 +971,11 @@ if (!procedimiento.encontrado()) {
 
 // La única invocación al Executor de todo el proyecto, y está aquí: después del if, no antes.
 Ejecucion ejecucion = executorAgent.ejecutar(procedimiento);
+
+String executionId = UUID.randomUUID().toString();
+auditar(executionId, sessionId, procedimiento, ejecucion);
+publicar(executionId, ejecucion);
+
 return redactar(procedimiento, ejecucion);
 ```
 
@@ -1018,7 +1028,7 @@ La segunda línea es la que importa. Un modelo puede perfectamente listar un pas
 
 Las tools se ejecutan de verdad —el log de la consola lo prueba—, pero el que redacta el informe es el mismo modelo que las invocó. No hay, todavía, nadie que compare lo que dice el JSON con lo que realmente se llamó.
 
-Para una demo es aceptable y el prompt insiste en ello (*"no des por ejecutado un paso que no invocaste"*), pero conviene decirlo: la comprobación de verdad es el **registro de auditoría**, y llega en su paso del roadmap. Ese registro no se escribe desde el informe del modelo, se escribe desde el lado Java de cada invocación.
+Para una demo es aceptable y el prompt insiste en ello (*"no des por ejecutado un paso que no invocaste"*), pero conviene decirlo con precisión, ahora que la [auditoría](#auditoría-y-envío-el-rastro-de-la-ejecución) ya existe: **lo que se persiste es el informe del modelo, no una traza de invocaciones reales.** La fila de `MySQL.ejecucion` es fiel a lo que el Executor devolvió, no necesariamente a lo que ocurrió. Cerrar ese hueco significa que cada tool anote su propia llamada desde el lado Java y que alguien compare las dos versiones; no está hecho.
 
 ### Lo que este agente todavía no hace
 
@@ -1026,10 +1036,11 @@ Para una demo es aceptable y el prompt insiste en ello (*"no des por ejecutado u
 |---|---|
 | Reintentos (3 × 5 s) por paso | [Políticas transversales](#reintentos) |
 | Clave de idempotencia `{execution-id}:{step-index}` | [Idempotencia](#idempotencia) |
-| Persistir el informe en `MySQL.auditoria` | [Esquema de auditoría](#esquema-de-auditoría) |
-| Publicar el resultado al External System | [Dos estados independientes](#dos-estados-independientes) |
+| Que la auditoría registre las invocaciones reales, no el relato del modelo | esta sección |
 
 Sin reintentos, la idempotencia todavía no tiene consumidor: una clave que nadie repite no protege de nada. Las dos cosas llegan juntas o no llegan.
+
+Lo que sí quedó cerrado es el destino del informe: el Router lo persiste y lo publica en cuanto el Executor termina — ver [Auditoría y envío](#auditoría-y-envío-el-rastro-de-la-ejecución).
 
 ### Qué se puede probar sin red
 
@@ -1043,6 +1054,184 @@ Ninguno de los cuatro tests del Executor habla con OpenAI:
 | `ExecutorPromptTemplateTest` | El renderizado de las dos plantillas, incluido un nombre de procedimiento con llaves |
 
 Lo que no se prueba sin LLM es el bucle de *tool calling* completo: para eso hay que levantar el sistema y mirar el log, que es justo lo que muestra [Uso](#respuesta--rama-de-ejecución).
+
+---
+
+## Auditoría y envío: el rastro de la ejecución
+
+Hasta aquí la rama de acción ya hacía su trabajo: Process decide *qué*, Executor lo *hace* y el Router lo *cuenta*. Lo que faltaba es lo que queda **después** de contestar. Una ejecución que solo existe en el log de la consola es una ejecución que, a efectos prácticos, nadie puede demostrar.
+
+Son dos escrituras, y las dos son del Router:
+
+```mermaid
+graph LR
+    E[Agent Executor] -->|"Ejecucion (JSON)"| R[Agent Router]
+    R -->|"1 · INSERT"| DB[("MySQL<br/>tabla ejecucion")]
+    R -->|"2 · tool-enviar-ejecucion"| T{{"HerramientaSistemaExterno"}}
+    T --> X(["External System<br/>reportería"])
+    R -->|"3 · UPDATE estado_envio"| DB
+    R -->|"4 · respuesta"| U["👤 Empleado"]
+```
+
+### El orden de los cuatro pasos no es casual
+
+```java
+Ejecucion ejecucion = executorAgent.ejecutar(procedimiento);
+
+String executionId = UUID.randomUUID().toString();
+
+auditar(executionId, sessionId, procedimiento, ejecucion);   // primero el rastro local
+publicar(executionId, ejecucion);                            // luego el sistema externo
+
+return redactar(procedimiento, ejecucion);                   // y al final se contesta
+```
+
+| Decisión | Alternativa descartada | Por qué |
+|---|---|---|
+| Auditar **antes** de publicar | Publicar y registrar después | Un fallo entre las dos operaciones dejaría al sistema externo enterado de algo que aquí no consta: la inconsistencia más difícil de investigar, porque no hay dónde mirar |
+| Contestar **al final** | Contestar y auditar en segundo plano | El empleado no ve un *"listo"* hasta que lo que hubiera que anotar ya se intentó anotar |
+| El `executionId` lo genera el Router | Un `AUTO_INCREMENT` de MySQL | Hace falta **antes** de escribir: es lo que permite que la fila de auditoría y la línea de log del envío hablen de lo mismo. Y desde luego no lo genera el modelo, que se lo inventaría |
+
+### La tabla `ejecucion`
+
+```sql
+CREATE TABLE IF NOT EXISTS ejecucion (
+    execution_id     CHAR(36)     NOT NULL,
+    user_id          VARCHAR(100),
+    session_id       VARCHAR(100) NOT NULL,
+    procedimiento    VARCHAR(120) NOT NULL,
+    estado_ejecucion VARCHAR(20)  NOT NULL,
+    estado_envio     VARCHAR(20)  NOT NULL,
+    informe          TEXT         NOT NULL,
+    creado_en        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (execution_id)
+);
+```
+
+La crea `schema.sql` en cada arranque, y aquí hay una trampa que ya apareció con la memoria de conversación: **sin `spring.sql.init.mode: always` el script no toca MySQL**. El valor por defecto (`embedded`) solo actúa sobre bases en memoria, así que la aplicación arrancaría sin la tabla y sin decir nada.
+
+```yaml
+spring:
+  sql:
+    init:
+      mode: always        # obligatorio para que schema.sql llegue a MySQL
+```
+
+Son dos mecanismos distintos creando dos tablas en la misma base de datos, y conviene no confundirlos:
+
+| Tabla | Quién la crea | Con qué |
+|---|---|---|
+| `SPRING_AI_CHAT_MEMORY` | Spring AI | `spring.ai.chat.memory.repository.jdbc.initialize-schema` |
+| `ejecucion` | Spring Boot | `schema.sql` + `spring.sql.init.mode` |
+
+Tres decisiones de tipos que no son evidentes:
+
+**1. `user_id` admite `NULL`.** Todavía no hay autenticación, así que el claim no existe. Dejar la columna vacía dice la verdad; rellenarla con un `"desconocido"` convertiría el registro de auditoría en una fuente de datos falsos. Y cuando exista, guardará **el claim, nunca el token** — un log de auditoría con credenciales dentro es un almacén de secretos.
+
+**2. `informe` es `TEXT`, no `JSON`** — al contrario que la columna `secuencia` del repositorio [`mcp-spring`](https://github.com/xxce10xx/mcp-spring#la-tabla-procesos). No es incoherencia, es que el caso es otro: allí el JSON lo escribe una persona a mano y que MySQL lo valide al insertar evita un procedimiento roto; aquí lo serializa Jackson desde un record ya normalizado, así que la validación no protege de nada. En cambio `TEXT` permite **un único `schema.sql`** para MySQL y para el H2 de los tests, que no acepta una cadena en una columna `JSON`.
+
+**3. Dos columnas de estado, no una.** Ver [Dos estados independientes](#dos-estados-independientes).
+
+### El informe entero, y cuatro columnas que lo repiten
+
+En la fila conviven dos formas del mismo dato, a propósito:
+
+| Forma | Para qué |
+|---|---|
+| `informe` — el structured output serializado completo | La copia fiel de lo que devolvió el modelo, sin interpretar. Si mañana el contrato gana campos, las filas viejas siguen contando lo que se supo entonces |
+| `procedimiento`, `session_id` y los dos estados | Para poder consultarlos con un `WHERE` normal |
+
+La pregunta que justifica la tabla tiene que ser un `SELECT` simple, y con la duplicación lo es:
+
+```sql
+-- Ejecuciones que salieron bien y de las que el sistema externo nunca se enteró
+SELECT execution_id, procedimiento, creado_en
+  FROM ejecucion
+ WHERE estado_ejecucion = 'EXITOSO'
+   AND estado_envio     = 'PENDIENTE_ENVIO';
+```
+
+### Por qué audita el Router y no el Executor
+
+El Executor es quien produce los efectos, así que parecería el sitio natural. No lo es, por dos motivos:
+
+- **No sabe dónde está.** No recibe el `sessionId` ni la memoria — [y es deliberado](#la-memoria-pertenece-al-router). Sin sesión no hay correlación posible con la conversación.
+- **Quien audita nunca es el auditado.** El agente que ejecuta no debería poder decidir si su propia ejecución queda anotada.
+
+### La tool del sistema externo: una tool que el modelo no ve
+
+```java
+@Component
+public class HerramientaSistemaExterno {
+
+    public static final String NOMBRE = "tool-enviar-ejecucion";
+
+    @Tool(name = NOMBRE, description = "Publica en el sistema externo de reporteria el informe ...")
+    public String enviar(String executionId, Ejecucion ejecucion) {
+        String payload = jsonMapper.writeValueAsString(ejecucion);
+        log.info(">>> {} envia la ejecucion {} al External System: {}", NOMBRE, executionId, payload);
+        return "Ejecucion " + executionId + " recibida por el External System";
+    }
+}
+```
+
+Lleva `@Tool` —es una tool con todas las letras, y el día que el envío sea una llamada HTTP real solo cambia el cuerpo del método— pero **no está registrada en ningún `ChatClient`**. Ningún LLM la ve, y por tanto ninguno puede decidir invocarla: la llama el Router con una línea de Java.
+
+Es la misma decisión que ya se tomó al [llamar al MCP con código](#2-se-llama-al-mcp-con-código-no-con-tool-calling), y la regla que sale de las dos es la que decide dónde se pone una tool:
+
+| Tool | Quién decide la llamada | Por qué |
+|---|---|---|
+| `tool-A`, `tool-B`, `tool-C` | El modelo | Cuáles y en qué orden depende del procedimiento: la decisión es genuina |
+| `tool-enviar-ejecucion` | El Router, con código | Se envía en el 100% de las ejecuciones. Preguntarle al modelo sería pagar una llamada extra para que conteste lo que ya sabemos — y arriesgarse a que contestara que no |
+
+> **El *tool calling* se gana su sitio cuando la decisión de llamar es genuina.** Una tool que hay que invocar siempre no es una decisión, es una línea de código.
+
+Se serializa el informe para pintarlo porque lo que interesa ver es **el payload**: exactamente el mismo JSON que se guardó en la columna `informe` y exactamente el que viajaría por HTTP. Un `toString()` de record mostraría otra cosa.
+
+### Ni auditar ni publicar pueden romper la respuesta
+
+Las dos llamadas van envueltas en su `try/catch`, y no es descuido. Cuando se ejecutan, **las tools ya corrieron**: los efectos están hechos y no se deshacen porque un `INSERT` no entre.
+
+| Qué falla | Qué ocurre | Por qué |
+|---|---|---|
+| El `INSERT` de auditoría | `log.error` y se contesta igual | Propagar la excepción le diría al empleado que su trámite falló cuando en realidad se hizo. Esa mentira es peor que la falta de rastro |
+| El envío al External System | `log.error`; la fila se queda en `PENDIENTE_ENVIO` | Es exactamente para lo que existe ese estado |
+| El `UPDATE` no encuentra la fila | `log.warn` | Significa que el `INSERT` anterior falló, y eso ya se registró. Una segunda excepción solo taparía la primera |
+
+Dicho con honestidad: en un sistema real, *"la ejecución quedó sin registrar"* no es una línea de log, es una alerta. Una ejecución sin rastro es justo lo que la auditoría existe para evitar.
+
+Y el `estado_envio` solo cambia **después** de que el envío haya vuelto sin error. Marcarlo antes convertiría la columna en una declaración de intenciones.
+
+### En la consola
+
+Lo que se ve al tramitar *"pedir vacaciones"*, tras las líneas de las tools:
+
+```text
+INFO  c.b.a.executor.HerramientasFicticias : >>> tool-A ejecutada
+INFO  c.b.a.executor.HerramientasFicticias : >>> tool-B ejecutada
+INFO  c.b.agents.executor.ExecutorAgent    : Executor: 'pedir vacaciones' termino con estado EXITOSO (2 pasos correctos, 0 fallidos)
+INFO  c.b.a.auditoria.AuditoriaRepository  : Auditoria: ejecucion 9f1c…c31f registrada ('pedir vacaciones', EXITOSO, PENDIENTE_ENVIO)
+INFO  c.b.a.externo.HerramientaSistemaExterno : >>> tool-enviar-ejecucion envia la ejecucion 9f1c…c31f al External System: {"estado":"EXITOSO","pasosExitosos":[{"paso":1,"herramienta":"tool-A","detalle":"..."}],"pasosFallidos":[],"resumen":"..."}
+INFO  c.b.a.auditoria.AuditoriaRepository  : Auditoria: ejecucion 9f1c…c31f marcada como ENVIADO
+```
+
+El mismo `executionId` aparece tres veces: es lo que permite cruzar el log con la fila de la tabla.
+
+### Qué se puede probar sin red
+
+| Test | Qué protege |
+|---|---|
+| `AuditoriaRepositoryTest` | El viaje completo de ida y vuelta sobre **H2 con el mismo `schema.sql` que MySQL**: que el DDL es válido, que las columnas concuerdan con los componentes del record —un mapeo por nombre que falla en silencio dejando `null`—, que el estado de envío arranca en `PENDIENTE_ENVIO` y que `marcarEnviado()` tolera la fila ausente |
+| `HerramientaSistemaExternoTest` | Que la tool publica su nombre y su `description`, y que la confirmación lleva el `executionId` dentro — sin eso, una línea de log no se podría cruzar con su fila |
+
+### Lo que esta pieza todavía no hace
+
+| Pendiente | Nota |
+|---|---|
+| Reintentos del envío (3 × 5 s) | Documentado en [Reintentos](#reintentos), sin implementar. Hoy un envío fallido se queda `PENDIENTE_ENVIO` y nadie lo vuelve a intentar |
+| Rellenar `user_id` | Necesita el claim del token: [paso 8 del roadmap](#roadmap) |
+| Que el envío sea una llamada real | La tool es ficticia; solo el cuerpo del método cambiaría |
+| Que el `executionId` llegue a las tools | Es la mitad de la clave de [idempotencia](#idempotencia), y hoy no sale del Router |
 
 ---
 
@@ -1295,8 +1484,8 @@ sequenceDiagram
     participant E as Agent Executor
     participant L as OpenAI LLM
     participant T as Tools de negocio
-    participant A as MySQL auditoría
-    participant X as External System
+    participant A as MySQL tabla ejecucion
+    participant X as External System (tool ficticia)
 
     U->>R: "Reserva mis vacaciones"
     R->>R: clasifica intención → ACCIÓN
@@ -1315,14 +1504,15 @@ sequenceDiagram
     end
     L-->>E: informe estructurado
     E-->>R: {estado: EXITOSO, pasosExitosos[], pasosFallidos[]}
-    R->>A: persiste (EXITOSO, PENDIENTE_ENVIO)
-    R->>X: envía resultado
-    X-->>R: 200 OK
-    R->>A: actualiza estado_envio = ENVIADO
+    R->>R: executionId = UUID.randomUUID()
+    R->>A: INSERT (EXITOSO, PENDIENTE_ENVIO, informe JSON)
+    R->>X: tool-enviar-ejecucion(executionId, informe)
+    X-->>R: confirmación
+    R->>A: UPDATE estado_envio = ENVIADO
     R-->>U: confirmación
 ```
 
-> **Implementado hasta `E-->>R`.** El recorrido `Router → Process → MCP → Executor → tools` funciona de punta a punta ([Agent Process](#agent-process-el-catálogo-por-mcp) y [Agent Executor](#agent-executor-las-tools-y-el-informe)); el `execution-id` y los reintentos por paso, la auditoría y el envío al External System llegan en sus pasos del roadmap. Todo el `loop` del diagrama cabe, en el código, en un único `call()`.
+> **El diagrama completo está implementado**, con una salvedad: los reintentos. El recorrido `Router → Process → MCP → Executor → tools → auditoría → External System` funciona de punta a punta ([Agent Process](#agent-process-el-catálogo-por-mcp), [Agent Executor](#agent-executor-las-tools-y-el-informe) y [Auditoría y envío](#auditoría-y-envío-el-rastro-de-la-ejecución)); lo que falta es reintentar un paso que falla y su idempotencia, y que el `External System` sea algo más que un log. Todo el `loop` del diagrama cabe, en el código, en un único `call()`.
 
 ### Rama de ejecución — fallo en un paso
 
@@ -1332,8 +1522,8 @@ sequenceDiagram
     participant E as Agent Executor
     participant L as OpenAI LLM
     participant T as Tools de negocio
-    participant A as MySQL auditoría
-    participant X as External System
+    participant A as MySQL tabla ejecucion
+    participant X as External System (tool ficticia)
 
     R->>E: ejecutar(Procedimiento con pasos[])
     E->>L: pasos numerados + esquema de las tools
@@ -1345,13 +1535,15 @@ sequenceDiagram
     L-->>E: informe: 1 exitoso, 2 y siguientes fallidos
     E-->>R: {estado: FALLIDO, pasosExitosos[], pasosFallidos[]}
     Note over E,R: nunca lanza excepción:<br/>el fallo viaja como dato
-    R->>A: persiste (FALLIDO, PENDIENTE_ENVIO)
-    R->>X: envía resultado
-    X-->>R: 200 OK
-    R->>A: actualiza estado_envio = ENVIADO
+    R->>A: INSERT (FALLIDO, PENDIENTE_ENVIO, informe JSON)
+    R->>X: tool-enviar-ejecucion(executionId, informe)
+    X-->>R: confirmación
+    R->>A: UPDATE estado_envio = ENVIADO
 ```
 
 Cuando un paso falla, los que venían detrás **no se intentan**, y aparecen igualmente en `pasosFallidos` con el motivo escrito en su `detalle`. El estado general es `FALLIDO` aunque el modelo diga otra cosa: [lo deriva Java del detalle](#el-informe-no-lo-firma-el-modelo-lo-normaliza-java).
+
+Un trámite fallido **se audita y se publica exactamente igual** que uno exitoso: el sistema externo tiene que enterarse de los dos casos, y la fila que interesa investigar mañana es justo la que fue mal.
 
 ### Procedimiento inexistente
 
@@ -1416,24 +1608,29 @@ Lo que devuelve hoy el modelo, tal cual:
 | `paso` | El modelo | La posición numerada que se le dio en el prompt, empezando en 1 |
 | `resumen` | El modelo | Lo único de este objeto que puede acabar leyendo el empleado |
 
-Tres campos del contrato **todavía no están**: `executionId`, `userId` y `sessionId`. No los puede escribir el modelo —se los inventaría—, así que entrarán cuando el Router los añada al persistir, junto con la [auditoría](#esquema-de-auditoría) y la [idempotencia](#idempotencia).
+**El JSON no lleva `executionId`, `userId` ni `sessionId`, y no es un olvido.** Ninguno de los tres los puede escribir el modelo: se los inventaría. Son datos del Router, así que viven en las **columnas** de la fila de auditoría, no dentro del informe. El JSON es el relato del modelo; las columnas son lo que el sistema sabe.
 
 ### Esquema de auditoría
 
+El DDL real, en `src/main/resources/schema.sql`:
+
 ```sql
-CREATE TABLE ejecucion (
-    execution_id      CHAR(36)     PRIMARY KEY,
-    user_id           VARCHAR(100) NOT NULL,
-    session_id        VARCHAR(100) NOT NULL,
-    procedimiento     VARCHAR(120) NOT NULL,
-    estado_ejecucion  VARCHAR(20)  NOT NULL,
-    estado_envio      VARCHAR(20)  NOT NULL,
-    pasos             JSON         NOT NULL,
-    creado_en         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS ejecucion (
+    execution_id     CHAR(36)     NOT NULL,
+    user_id          VARCHAR(100),
+    session_id       VARCHAR(100) NOT NULL,
+    procedimiento    VARCHAR(120) NOT NULL,
+    estado_ejecucion VARCHAR(20)  NOT NULL,
+    estado_envio     VARCHAR(20)  NOT NULL,
+    informe          TEXT         NOT NULL,
+    creado_en        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (execution_id)
 );
 ```
 
-> **`user_id` guarda el claim extraído del token, nunca el token.** Un log de auditoría que almacene credenciales se convierte en un almacén de secretos.
+Tres diferencias respecto al diseño original de este README, y las tres se explican en [Auditoría y envío](#la-tabla-ejecucion): la columna `pasos JSON` es ahora `informe TEXT` y guarda el structured output completo, no solo los pasos; `user_id` admite `NULL` mientras no exista autenticación; y el `IF NOT EXISTS` es lo que permite que el script se ejecute en cada arranque.
+
+> **`user_id` guardará el claim extraído del token, nunca el token.** Un log de auditoría que almacene credenciales se convierte en un almacén de secretos.
 
 ### Dos estados independientes
 
@@ -1453,12 +1650,15 @@ stateDiagram-v2
     PENDIENTE_ENVIO --> PENDIENTE_ENVIO: reintento falla
     ENVIADO --> [*]
     note right of PENDIENTE_ENVIO
-        Agotados los 3 intentos
-        el registro permanece aquí.
+        Hoy, sin reintentos,
+        un envío fallido se queda
+        aquí para siempre.
         La auditoría local es la
         red de seguridad.
     end note
 ```
+
+Los dos estados ya se escriben de verdad: `PENDIENTE_ENVIO` en el `INSERT` y `ENVIADO` en un `UPDATE` posterior, solo si el envío volvió sin error. La transición que todavía no existe es el bucle: no hay reintento que la recorra.
 
 ### Estados de un paso
 
@@ -1494,7 +1694,7 @@ Una sola política, aplicada en los dos únicos puntos que la necesitan:
 
 Deliberadamente **sin backoff exponencial, sin cola durable y sin worker de reintento**. Si los 3 intentos de envío se agotan, el registro queda en `PENDIENTE_ENVIO` y la auditoría local cumple su función. Para un sistema de producción el patrón correcto sería un *outbox* con worker desacoplado; aquí sería complejidad sin valor didáctico.
 
-> **Ninguno de los dos puntos está implementado todavía.** El [Agent Executor](#agent-executor-las-tools-y-el-informe) ya ejecuta las tools, pero un paso que falla se marca como fallido sin reintentarlo. Ver [Lo que este agente todavía no hace](#lo-que-este-agente-todavía-no-hace).
+> **Ninguno de los dos puntos está implementado todavía**, y ya son los dos únicos huecos de la rama de acción. Un paso que falla se marca como fallido sin reintentarlo, y un envío que falla deja la fila en `PENDIENTE_ENVIO` sin que nadie vuelva a intentarlo. Ver [Lo que este agente todavía no hace](#lo-que-este-agente-todavía-no-hace) y [Lo que esta pieza todavía no hace](#lo-que-esta-pieza-todavía-no-hace).
 
 ### Idempotencia
 
@@ -1504,11 +1704,11 @@ Deliberadamente **sin backoff exponencial, sin cola durable y sin worker de rein
 {execution-id}:{step-index}
 ```
 
-El `execution-id` lo genera el Router al invocar al Executor.
-
 > **No basta con `session-id`.** Si un empleado solicita vacaciones dos veces en la misma sesión, la segunda solicitud sería descartada como duplicado falso. El `execution-id` distingue ejecuciones; el `step-index`, pasos dentro de una ejecución.
 
-Aún no hay `execution-id`, y es coherente: **sin reintentos, la idempotencia no tiene consumidor**. Una clave que nadie repite no protege de nada, así que las dos piezas llegan juntas. Las tools ficticias actuales son idempotentes por accidente —escriben una línea en el log y no guardan nada—, lo cual no cuenta como diseño.
+El `execution-id` **ya existe**: lo genera el Router con `UUID.randomUUID()` en cuanto el Executor termina, y es la clave primaria de la fila de auditoría. Lo que falta es la otra mitad y el consumidor: no llega a las tools —ninguna recibe hoy con qué distinguir dos invocaciones— y **sin reintentos la idempotencia no tiene a quién proteger**. Una clave que nadie repite no protege de nada, así que las dos piezas llegan juntas.
+
+Las tools ficticias actuales son idempotentes por accidente —escriben una línea en el log y no guardan nada—, lo cual no cuenta como diseño.
 
 ### Autenticación e identidad
 
@@ -1608,12 +1808,16 @@ spring:
   application:
     name: agents
 
-  # Una sola instancia MySQL para memoria de conversación y, más adelante, auditoría
+  # Una sola instancia MySQL para memoria de conversación y auditoría de ejecuciones
   datasource:
     url: jdbc:mysql://localhost:3306/sprintai
     username: ${MYSQL_USERNAME}
     password: ${MYSQL_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
+
+  sql:
+    init:
+      mode: always          # ejecuta schema.sql: crea la tabla ejecucion (auditoría)
 
   ai:
     openai:
@@ -1713,6 +1917,7 @@ Presentes en `pom.xml`:
 | `spring-ai-vector-store-advisor` | Aporta `QuestionAnswerAdvisor`, el advisor que hace el RAG |
 | `spring-ai-starter-mcp-client` | Cliente MCP del Agent Process: `McpSyncClient` y la autoconfiguración de las conexiones |
 | `spring-ai-starter-model-chat-memory-repository-jdbc` | `JdbcChatMemoryRepository` y el DDL de la tabla de memoria |
+| `spring-boot-starter-jdbc` | `JdbcClient` y el pool de conexiones para la tabla de auditoría |
 | `mysql-connector-j` | Driver de MySQL |
 | `spring-boot-starter-test` | Pruebas |
 | `h2` | Base de datos en memoria, solo para los tests |
@@ -1721,11 +1926,9 @@ Presentes en `pom.xml`:
 
 > El starter del cliente MCP arrastra `spring-ai-autoconfigure-mcp-client-common` y `-httpclient`: el primero crea los `McpSyncClient` a partir de las conexiones declaradas, el segundo aporta el transporte HTTP. No hace falta declarar el SDK de MCP aparte.
 
-Previstas, se añadirán en los pasos correspondientes:
+> `spring-boot-starter-jdbc` **ya llegaba** como dependencia transitiva del starter de memoria, así que el código habría compilado sin declararlo. Se declara igual porque el proyecto usa `JdbcClient` directamente: depender de algo por accidente funciona hasta que la dependencia de arriba cambia de opinión.
 
-| Artefacto | Habilita |
-|---|---|
-| `spring-boot-starter-data-jpa` | Persistencia de auditoría |
+No hay `spring-boot-starter-data-jpa`, y no es un olvido: la auditoría son un `INSERT`, un `UPDATE` y un `SELECT` por identificador. Un `EntityManager`, un ciclo de vida de entidades y un dialecto para tres sentencias es más maquinaria de la que el problema pide. Se explica en detalle en [La tabla `ejecucion`](#la-tabla-ejecucion).
 
 ---
 
@@ -1779,16 +1982,29 @@ El Router clasifica `ACCION`, Process consulta el catálogo por MCP, el LLM elig
 }
 ```
 
-En la consola de la aplicación se ve la otra mitad, que es la que prueba que las tools se ejecutaron de verdad:
+En la consola de la aplicación se ve la otra mitad, que es la que prueba que las tools se ejecutaron de verdad y que la ejecución dejó rastro:
 
 ```text
 INFO  c.b.agents.executor.ExecutorAgent    : Executor: arranca 'pedir vacaciones' con 2 pasos: tool-A -> tool-B
 INFO  c.b.a.executor.HerramientasFicticias : >>> tool-A ejecutada
 INFO  c.b.a.executor.HerramientasFicticias : >>> tool-B ejecutada
 INFO  c.b.agents.executor.ExecutorAgent    : Executor: 'pedir vacaciones' termino con estado EXITOSO (2 pasos correctos, 0 fallidos)
+INFO  c.b.a.auditoria.AuditoriaRepository  : Auditoria: ejecucion 9c1f...b22 registrada ('pedir vacaciones', EXITOSO, PENDIENTE_ENVIO)
+INFO  c.b.a.externo.HerramientaSistemaExterno : >>> tool-enviar-ejecucion envia la ejecucion 9c1f...b22 al External System: {"estado":"EXITOSO",...}
+INFO  c.b.a.auditoria.AuditoriaRepository  : Auditoria: ejecucion 9c1f...b22 marcada como ENVIADO
 ```
 
-Los pasos que se ejecutaron salieron de la fila de `MySQL.procesos`, no del modelo: el LLM solo eligió **cuál** de los procedimientos aplica y en qué momento invocar cada tool. Necesita el servidor MCP levantado en el 8082; si no lo está, la petición devuelve `500` y el log dice por qué.
+El mismo `executionId` aparece tres veces: es lo que permite cruzar la fila de la base de datos con las líneas del log. Y la fila queda así:
+
+```sql
+SELECT execution_id, procedimiento, estado_ejecucion, estado_envio FROM ejecucion;
+```
+
+| execution_id | procedimiento | estado_ejecucion | estado_envio |
+|---|---|---|---|
+| `9c1f…b22` | pedir vacaciones | `EXITOSO` | `ENVIADO` |
+
+Los pasos que se ejecutaron salieron de la fila de `MySQL.procesos`, no del modelo: el LLM solo eligió **cuál** de los procedimientos aplica y en qué momento invocar cada tool. Necesita el servidor MCP levantado en el 8082; si no lo está, la petición devuelve `500` y el log dice por qué. Los detalles de las dos últimas líneas están en [Auditoría y envío](#auditoría-y-envío-el-rastro-de-la-ejecución).
 
 Cuando un paso no se puede ejecutar —por ejemplo, si la `secuencia` de la base de datos nombra una tool que no existe— la respuesta lo dice sin adornos:
 
@@ -1801,7 +2017,7 @@ Cuando un paso no se puede ejecutar —por ejemplo, si la `secuencia` de la base
 }
 ```
 
-La forma prevista del contrato, cuando la auditoría esté en su sitio:
+El `executionId` ya existe y ya es la clave de la fila de auditoría, pero **todavía no sale en la respuesta HTTP**: hoy solo vive en el log y en la base de datos. La forma prevista del contrato lo expone, para que el empleado pueda citarlo al reclamar:
 
 ```json
 {
@@ -1877,15 +2093,21 @@ La construcción es **incremental**: un componente por iteración.
 | 6 | Agent Search: RAG sobre Qdrant y enrutamiento real de la rama informativa | ✅ Completado |
 | 7 | Clasificación tipada de intención (enum en lugar de constantes `String`) | ⬜ Pendiente |
 | 8 | Extracción del claim `user-id` desde el token | ⬜ Pendiente |
-| 9 | Persistencia: esquema de auditoría | ⬜ Pendiente |
+| 9 | Persistencia: esquema de auditoría | ✅ Completado |
 | 10 | Agent Process vía MCP + servidor [`mcp-spring`](https://github.com/xxce10xx/mcp-spring) | ✅ Completado |
 | 11 | Agent Executor con tres tools ficticias vía *tool calling* | ✅ Completado |
 | 12 | Reintentos por paso e idempotencia `{execution-id}:{step-index}` | ⬜ Pendiente |
-| 13 | Tool de envío al External System | ⬜ Pendiente |
+| 13 | Tool de envío al External System | ✅ Completado |
 
-Las dos ramas están cerradas de punta a punta. La informativa: entra una pregunta, se clasifica, se recupera de Qdrant, se responde con memoria de la conversación. La de acción: se clasifica, se consulta el catálogo real por MCP, el LLM elige el procedimiento y el Executor ejecuta sus tools en orden, devolviendo un informe estructurado.
+Las dos ramas están cerradas de punta a punta. La informativa: entra una pregunta, se clasifica, se recupera de Qdrant, se responde con memoria de la conversación. La de acción: se clasifica, se consulta el catálogo real por MCP, el LLM elige el procedimiento, el Executor ejecuta sus tools en orden y devuelve un informe estructurado, y el Router lo registra en `MySQL.ejecucion` y lo publica en el sistema externo antes de contestarle al empleado.
 
-Lo que queda no es funcionalidad para el empleado, es **rastro y robustez**: la auditoría (paso 9), los reintentos con su idempotencia (12) y el envío al sistema externo (13). Hoy una ejecución ocurre y no deja constancia más allá del log.
+Quedan tres huecos, y ninguno es funcionalidad nueva para el empleado:
+
+| # | Hueco | Por qué importa |
+|---|---|---|
+| 7 | Intención tipada | Hoy la clasificación viaja como `String`; un enum haría imposible el error de escritura |
+| 8 | Claim `user-id` | La columna `user_id` existe y se queda a `NULL`: la auditoría dice qué pasó, no de quién |
+| 12 | Reintentos + idempotencia | Un paso que falla por un timeout no se reintenta, y un envío que no llega se queda en `PENDIENTE_ENVIO` para siempre |
 
 ### Fuera de alcance
 
@@ -1940,6 +2162,12 @@ Decisiones tomadas conscientemente, no omisiones:
         │   │   │       ├── Ejecucion.java       # structured output: dos listas y un estado
         │   │   │       ├── PasoEjecutado.java   # un paso, con su numero y su detalle
         │   │   │       └── EstadoEjecucion.java # EXITOSO | FALLIDO
+        │   │   ├── auditoria/
+        │   │   │   ├── AuditoriaRepository.java # JdbcClient: INSERT, UPDATE y SELECT
+        │   │   │   ├── RegistroEjecucion.java   # la fila leida, un record por columna
+        │   │   │   └── EstadoEnvio.java         # PENDIENTE_ENVIO | ENVIADO
+        │   │   ├── externo/
+        │   │   │   └── HerramientaSistemaExterno.java # @Tool que ningun LLM ve
         │   │   ├── memory/
         │   │   │   └── ChatMemoryConfig.java    # ChatMemory: almacén + política
         │   │   └── guardrail/
@@ -1949,6 +2177,7 @@ Decisiones tomadas conscientemente, no omisiones:
         │   │       └── GuardrailExceptionHandler.java  # traduce a 403 genérico
         │   └── resources/
         │       ├── application.yaml
+        │       ├── schema.sql                   # DDL de la tabla ejecucion (auditoria)
         │       ├── documentos/                  # corpus ficticio del RAG
         │       │   ├── vacaciones.md
         │       │   ├── licencias-y-permisos.md
@@ -1981,12 +2210,16 @@ Decisiones tomadas conscientemente, no omisiones:
             │   │   ├── ExecutorPromptTemplateTest.java
             │   │   └── dto/
             │   │       └── EjecucionTest.java         # normalizacion del informe del LLM
+            │   ├── auditoria/
+            │   │   └── AuditoriaRepositoryTest.java   # el schema.sql real, contra H2
+            │   ├── externo/
+            │   │   └── HerramientaSistemaExternoTest.java # nombre y confirmacion del envio
             │   └── search/
             │       └── DocumentosTest.java            # leer + trocear, sin Qdrant
             └── resources/
                 └── application.yaml                   # H2, Qdrant y MCP sin contactar
 ```
 
-Cada agente vive en su propio paquete bajo `com.bardalez.agents`, con su agente, su configuración de `ChatClient` y sus prompts: los cuatro están ya en su sitio y siguen la misma estructura interna. `memory` y `guardrail` son la excepción deliberada: son transversales, los usa más de un agente.
+Cada agente vive en su propio paquete bajo `com.bardalez.agents`, con su agente, su configuración de `ChatClient` y sus prompts: los cuatro están ya en su sitio y siguen la misma estructura interna. Los otros cuatro paquetes son la excepción deliberada, y por dos motivos distintos: `guardrail` y `memory` son transversales —los usa más de un agente—, mientras que `auditoria` y `externo` no son de ningún agente en particular, sino las dos capacidades con las que el Router deja rastro de lo que ya ocurrió.
 
 El quinto paquete de la arquitectura no está aquí: el catálogo de procedimientos es un repositorio aparte, [`mcp-spring`](https://github.com/xxce10xx/mcp-spring), con su propio `pom.xml`, su propia base de datos y su propio [README](https://github.com/xxce10xx/mcp-spring#readme). Lo único que comparten los dos proyectos es el JSON que viaja por el protocolo.

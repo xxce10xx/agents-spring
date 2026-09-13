@@ -2,12 +2,15 @@ package com.bardalez.agents.router;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
+import com.bardalez.agents.auditoria.AuditoriaRepository;
 import com.bardalez.agents.executor.ExecutorAgent;
 import com.bardalez.agents.executor.dto.Ejecucion;
 import com.bardalez.agents.executor.dto.EstadoEjecucion;
 import com.bardalez.agents.executor.dto.PasoEjecutado;
+import com.bardalez.agents.externo.HerramientaSistemaExterno;
 import com.bardalez.agents.guardrail.TopicGuardrail;
 import com.bardalez.agents.process.ProcessAgent;
 import com.bardalez.agents.process.dto.Procedimiento;
@@ -43,6 +46,11 @@ import org.springframework.stereotype.Service;
  * la memoria viviera en el Agent Search, la rama de accion (Process y Executor) se quedaria sin
  * conversacion. Aqui la memoria se recupera una vez y sirve para dos cosas: dar contexto al
  * clasificador y viajar al agente destino como un dato mas.
+ *
+ * <p>Por el mismo motivo es tambien el dueno de la <strong>auditoria</strong> y del <strong>envio al
+ * sistema externo</strong>: los dos necesitan saber en que sesion ocurrio la ejecucion, y el Executor
+ * no lo sabe. Que sea el Router quien registre tiene ademas una consecuencia sana: el agente que
+ * produce los efectos no decide si su ejecucion queda anotada.
  */
 @Service
 public class RouterAgent {
@@ -59,6 +67,8 @@ public class RouterAgent {
     private final ProcessAgent processAgent;
     private final ExecutorAgent executorAgent;
     private final ChatMemory chatMemory;
+    private final AuditoriaRepository auditoriaRepository;
+    private final HerramientaSistemaExterno sistemaExterno;
 
     public RouterAgent(ChatClient routerChatClient,
                        @Value("classpath:prompts/router-user.st") Resource userPrompt,
@@ -66,7 +76,9 @@ public class RouterAgent {
                        SearchAgent searchAgent,
                        ProcessAgent processAgent,
                        ExecutorAgent executorAgent,
-                       ChatMemory chatMemory) {
+                       ChatMemory chatMemory,
+                       AuditoriaRepository auditoriaRepository,
+                       HerramientaSistemaExterno sistemaExterno) {
         this.chatClient = routerChatClient;
         this.userPromptTemplate = new PromptTemplate(userPrompt);
         this.topicGuardrail = topicGuardrail;
@@ -74,6 +86,8 @@ public class RouterAgent {
         this.processAgent = processAgent;
         this.executorAgent = executorAgent;
         this.chatMemory = chatMemory;
+        this.auditoriaRepository = auditoriaRepository;
+        this.sistemaExterno = sistemaExterno;
     }
 
     /**
@@ -92,10 +106,11 @@ public class RouterAgent {
 
         String intencion = clasificarIntencion(prompt, memoria);
 
-        // Las dos ramas reciben lo mismo: el prompt y la memoria ya recuperada. Ninguno de los dos
-        // agentes conoce la sesion ni toca la base de datos de conversacion.
+        // Los agentes destino reciben lo mismo: el prompt y la memoria ya recuperada. Ninguno conoce la
+        // sesion ni toca la base de datos. El sessionId baja por la rama de accion, pero no llega a
+        // ningun agente: se queda en el Router, que es quien lo necesita para auditar.
         String respuesta = ACCION.equals(intencion)
-                ? atenderAccion(prompt, memoria)
+                ? atenderAccion(prompt, memoria, sessionId)
                 : atenderInformativa(prompt, memoria);
 
         // Y el Router cierra el turno guardandolo, venga de donde venga la respuesta. Lo que queda en
@@ -116,14 +131,19 @@ public class RouterAgent {
     }
 
     /**
-     * Rama de accion: dos agentes en cadena. Process dice <em>que</em> hay que hacer y Executor lo
-     * hace.
+     * Rama de accion: dos agentes en cadena y, cuando terminan, el rastro. Process dice <em>que</em> hay
+     * que hacer, Executor lo hace, y el Router deja constancia antes de contestar.
      *
-     * <p>Ninguno de los dos devuelve texto: Process devuelve un {@link Procedimiento} y Executor un
-     * {@link Ejecucion}. Redactar la respuesta al empleado es trabajo del Router, aqui abajo, en
+     * <p>Ninguno de los dos agentes devuelve texto: Process devuelve un {@link Procedimiento} y Executor
+     * un {@link Ejecucion}. Redactar la respuesta al empleado es trabajo del Router, aqui abajo, en
      * {@link #redactar}: los agentes especializados devuelven datos y el hub decide como se cuentan.
+     *
+     * <p>El orden de los cuatro pasos no es casual: <strong>ejecutar, auditar, publicar, contestar</strong>.
+     * Auditar antes de publicar deja el rastro local aunque el sistema externo no responda; contestar al
+     * final significa que el empleado no ve un "listo" hasta que lo que hubiera que anotar ya se intento
+     * anotar.
      */
-    private String atenderAccion(String prompt, List<Message> memoria) {
+    private String atenderAccion(String prompt, List<Message> memoria, String sessionId) {
         log.debug("Rama de accion: se enruta a Process");
         Procedimiento procedimiento = processAgent.resolver(prompt, memoria);
 
@@ -144,7 +164,59 @@ public class RouterAgent {
         // del catalogo, asi que el Executor no elige que ejecutar; solo ejecuta.
         Ejecucion ejecucion = executorAgent.ejecutar(procedimiento);
 
+        // El identificador de la ejecucion lo genera el Router y no la base de datos, porque hace falta
+        // antes de escribir: es lo que permite que la fila de auditoria y la linea del log del envio
+        // hablen de lo mismo. Tampoco lo genera el modelo, por lo evidente: se lo inventaria.
+        String executionId = UUID.randomUUID().toString();
+
+        auditar(executionId, sessionId, procedimiento, ejecucion);
+        publicar(executionId, ejecucion);
+
         return redactar(procedimiento, ejecucion);
+    }
+
+    /**
+     * Guarda el informe del Executor en MySQL.
+     *
+     * <p><strong>Un fallo al auditar no rompe la peticion</strong>, y esa decision merece explicacion:
+     * cuando esta linea se ejecuta, las tools ya corrieron y sus efectos no se pueden deshacer porque
+     * un {@code INSERT} no entrara. Propagar la excepcion le diria al empleado que su tramite fallo
+     * cuando en realidad se hizo, y esa mentira es peor que la falta de rastro. En un sistema real esto
+     * seria una alerta: una ejecucion sin registro es justo lo que la auditoria existe para evitar.
+     */
+    private void auditar(String executionId,
+                         String sessionId,
+                         Procedimiento procedimiento,
+                         Ejecucion ejecucion) {
+        try {
+            auditoriaRepository.registrar(executionId, sessionId, procedimiento, ejecucion);
+        } catch (RuntimeException e) {
+            log.error("Auditoria: la ejecucion {} de '{}' quedo sin registrar: {}",
+                    executionId, procedimiento.proceso(), e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Envia el informe al sistema externo y, si llega, lo anota en la fila de auditoria.
+     *
+     * <p>El envio se hace con codigo, no como tool calling: ocurre en todas las ejecuciones, asi que no
+     * hay ninguna decision que delegar en el modelo. Ver {@link HerramientaSistemaExterno}.
+     *
+     * <p>Aqui tampoco sube la excepcion, y por el mismo motivo que en {@link #auditar}: el tramite ya
+     * esta hecho. Si el envio falla, la fila se queda en {@code PENDIENTE_ENVIO}, que es exactamente
+     * para lo que existe ese estado. Todavia no hay reintentos, asi que quien lo detecta es una
+     * consulta a la tabla.
+     */
+    private void publicar(String executionId, Ejecucion ejecucion) {
+        try {
+            sistemaExterno.enviar(executionId, ejecucion);
+            // El estado de envio solo cambia despues de que el envio haya vuelto sin error: marcarlo
+            // antes convertiria la columna en una declaracion de intenciones.
+            auditoriaRepository.marcarEnviado(executionId);
+        } catch (RuntimeException e) {
+            log.error("Envio: la ejecucion {} no llego al External System y queda pendiente: {}",
+                    executionId, e.getMessage(), e);
+        }
     }
 
     /**

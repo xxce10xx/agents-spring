@@ -2,13 +2,20 @@ spring:
   application:
     name: agents
 
-  # Unica base de datos del proyecto: la misma instancia MySQL guardara la memoria de
-  # conversacion y, mas adelante, la auditoria. Es una demo: se prioriza la simplicidad.
+  # Unica base de datos del proyecto: la misma instancia MySQL guarda la memoria de conversacion y la
+  # auditoria de ejecuciones. Es una demo: se prioriza la simplicidad.
   datasource:
     url: jdbc:mysql://localhost:3306/sprintai
     username: ${MYSQL_USERNAME}
     password: ${MYSQL_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
+
+  sql:
+    init:
+      # Ejecuta schema.sql en cada arranque para crear la tabla de auditoria si no existe.
+      # Con el valor por defecto (embedded) el script solo se aplicaria a una base en memoria, asi que
+      # sobre MySQL no pasaria nada: es la misma trampa que initialize-schema de la memoria.
+      mode: always
 
   ai:
     openai:

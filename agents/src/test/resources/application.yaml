@@ -10,6 +10,13 @@ spring:
     password: ""
     driver-class-name: org.h2.Driver
 
+  sql:
+    init:
+      # El mismo schema.sql de src/main: la tabla de auditoria se crea igual sobre H2, y por eso el
+      # DDL evita tipos que solo entienda MySQL. Con H2 bastaria el valor por defecto (embedded), pero
+      # se escribe para que quede claro que los tests prueban el esquema real y no otro.
+      mode: always
+
   ai:
     openai:
       api-key: test-key

@@ -65,6 +65,17 @@
 			<artifactId>spring-ai-starter-model-chat-memory-repository-jdbc</artifactId>
 		</dependency>
 
+		<!--
+			JdbcClient para la tabla de auditoria, sin JPA. Llega tambien como dependencia transitiva
+			del starter de memoria, pero se declara aparte porque ahora el codigo del proyecto lo usa
+			directamente: depender de algo por accidente funciona hasta que la dependencia de arriba
+			cambia.
+		-->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-jdbc</artifactId>
+		</dependency>
+
 		<dependency>
 			<groupId>com.mysql</groupId>
 			<artifactId>mysql-connector-j</artifactId>
